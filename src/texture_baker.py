@@ -146,7 +146,7 @@ def _unwrap_uvs(
         atlas.add_mesh(v32, f32)
         pack_opts = xatlas.PackOptions()
         pack_opts.resolution = int(tex_size)
-        pack_opts.padding = 2
+        pack_opts.padding = 4
         chart_opts = xatlas.ChartOptions()
         # A single chart-fitting iteration costs ~5x the whole unwrap on
         # 160k-triangle scans for a <10% stretch improvement, so keep the
@@ -222,7 +222,7 @@ def _unwrap_uvs_dual(
         )
         pack_opts = xatlas.PackOptions()
         pack_opts.resolution = int(tex_size)
-        pack_opts.padding = 2
+        pack_opts.padding = 4
         chart_opts = xatlas.ChartOptions()
         chart_opts.max_iterations = 0
         atlas.generate(chart_options=chart_opts, pack_options=pack_opts)
@@ -877,10 +877,10 @@ def bake_highres_uv_texture(
     if dev == "cuda":
         torch.cuda.empty_cache()
 
-    # 3px gutter dilation so UV islands mipmap without black seams
+    # 3px gutter dilation inside 4px island padding so mipmaps never bleed seams
     if np.any(~valid_mask):
         dist, inds = distance_transform_edt(~valid_mask, return_indices=True)
-        fill = (~valid_mask) & (dist <= 4.0)
+        fill = (~valid_mask) & (dist <= 3.0)
         if np.any(fill):
             tex_rgb[fill] = tex_rgb[inds[0][fill], inds[1][fill]]
 

@@ -413,6 +413,9 @@ def _iter_grid_nvdec_pass(
 
             actual_ts = float(got.time) if got.time is not None else target_sec
             last_sec = actual_ts
+            pts_map = stats.get("pts_sec")
+            if isinstance(pts_map, dict):
+                pts_map[f_target] = max(0.0, actual_ts - stream_start)
             yield f_target, bgr
 
         stats["completed"] = True
@@ -474,10 +477,16 @@ def extract_keyframes(
         max_candidates = max(max_frames * 3, 180)
         scan_stride = 2
 
-    want_highres = int(highres_max_dim) > 0 and int(max_candidates) <= 350
+    if highres_max_dim > 0:
+        hr_s = min(1.0, float(highres_max_dim) / float(max(orig_w, orig_h, 1)))
+        hr_px_bytes = max(64, int(round(orig_w * hr_s))) * max(64, int(round(orig_h * hr_s))) * 3
+        want_highres = (int(max_candidates) * hr_px_bytes) <= 1_600_000_000
+    else:
+        want_highres = False
+    cap.release()
     candidates: List[tuple[int, float, np.ndarray, np.ndarray, float, Optional[np.ndarray]]] = []
 
-    def _build_candidate(idx: int, bgr_img: np.ndarray):
+    def _build_candidate(idx: int, bgr_img: np.ndarray, ts_override: Optional[float] = None):
         h, w = bgr_img.shape[:2]
         hr_rgb: Optional[np.ndarray] = None
         if want_highres:
@@ -504,7 +513,7 @@ def extract_keyframes(
         rgb = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
         gray = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2GRAY)
         sharp = _score_sharpness(gray)
-        ts = idx / fps
+        ts = float(ts_override) if ts_override is not None else (idx / fps)
 
         # store only <= 160px grayscale thumbnail in candidates to save RAM on long videos
         h_g, w_g = gray.shape
@@ -517,9 +526,9 @@ def extract_keyframes(
 
         return (idx, ts, rgb, gray_thumb, sharp, hr_rgb)
 
-    def _process_frame(idx: int, bgr_img: np.ndarray):
+    def _process_frame(idx: int, bgr_img: np.ndarray, ts_override: Optional[float] = None):
         nonlocal scan_stride, candidates
-        candidates.append(_build_candidate(idx, bgr_img))
+        candidates.append(_build_candidate(idx, bgr_img, ts_override=ts_override))
         if (not has_known_window) and len(candidates) >= max_candidates * 2:
             candidates = candidates[::2]
             scan_stride *= 2
@@ -542,6 +551,7 @@ def extract_keyframes(
             "decoded_frames": 0,
             "decode_s": 0.0,
             "completed": False,
+            "pts_sec": {},
         }
         try:
             pending = deque()
@@ -549,7 +559,8 @@ def extract_keyframes(
                 for nv_i, (f_idx, bgr) in enumerate(
                     _iter_grid_nvdec(path, nvdec_targets, fps, nv_stats, cancel_cb)
                 ):
-                    pending.append(proc_pool.submit(_build_candidate, f_idx, bgr))
+                    ts_pts = nv_stats["pts_sec"].get(f_idx)
+                    pending.append(proc_pool.submit(_build_candidate, f_idx, bgr, ts_pts))
                     if len(pending) >= 3:
                         candidates.append(pending.popleft().result())
                     if progress_cb and nv_i % 8 == 0:
@@ -565,7 +576,6 @@ def extract_keyframes(
             )
         except Exception:
             if cancel_cb and cancel_cb():
-                cap.release()
                 raise RuntimeError("build cancelled by user")
             nvdec_ok = False
 
@@ -584,6 +594,9 @@ def extract_keyframes(
 
     # OpenCV fallback keeps the exact uniform grid its motion scoring was tuned on.
     if not nvdec_ok:
+        cap = cv2.VideoCapture(str(path))
+        if not cap.isOpened():
+            raise RuntimeError(f"opencv failed to open {path}")
         if scan_stride >= 180 and has_known_window:
             target_frames = list(range(start_frame, end_frame, scan_stride))
             for step_i, f_target in enumerate(target_frames):
@@ -630,7 +643,7 @@ def extract_keyframes(
                     frac = min(0.99, (frame_idx - start_frame) / max(1, window_frames))
                     progress_cb(frac * 0.25, f"scanning video... ({frame_idx}/{end_frame} frames)")
 
-    cap.release()
+        cap.release()
 
     if not candidates:
         raise RuntimeError("no readable frames in video")
@@ -642,12 +655,20 @@ def extract_keyframes(
         else (actual_total / fps)
     )
 
+    med_sharp = float(np.median([c[4] for c in candidates])) if candidates else 1.0
+
     if len(candidates) <= max_frames:
+        kept_cands = candidates
+        if len(candidates) > 16 and med_sharp > 1e-6:
+            blur_cut = 0.15 * med_sharp
+            sharp_cands = [c for c in candidates if c[4] >= blur_cut]
+            if len(sharp_cands) >= max(8, int(round(len(candidates) * 0.88))):
+                kept_cands = sharp_cands
         if progress_cb:
-            progress_cb(0.28, f"selected all {len(candidates)} keyframes")
+            progress_cb(0.28, f"selected {len(kept_cands)} keyframes")
         selected = [
             VideoFrame(index=c[0], timestamp=c[1], rgb=c[2], sharpness=c[4], highres_rgb=c[5])
-            for c in candidates
+            for c in kept_cands
         ]
         candidates.clear()
         return VideoData(
@@ -674,20 +695,29 @@ def extract_keyframes(
     chosen_indices: List[int] = []
     used: set[int] = set()
     n_cand = len(candidates)
+    blur_floor = 0.38 * med_sharp
 
     for t_idx, target in enumerate(target_arcs):
         if cancel_cb and cancel_cb():
             raise RuntimeError("build cancelled by user")
         center_i = int(np.argmin(np.abs(cum_mot - target)))
-        # check immediate neighbors (±1) and pick the sharpest frame that hasn't been used yet
         best_i = center_i
         best_sharp = -1.0
+        arc_step = cum_mot[-1] / max_frames
         for offset in (0, -1, 1, -2, 2):
             cand_i = center_i + offset
             if 0 <= cand_i < n_cand and cand_i not in used:
-                # only allow neighbor if it doesn't jump too far in motion arc
-                if abs(cum_mot[cand_i] - target) <= (cum_mot[-1] / max_frames) * 0.65 or best_sharp < 0:
+                if abs(cum_mot[cand_i] - target) <= arc_step * 0.65 or best_sharp < 0:
                     if candidates[cand_i][4] > best_sharp:
+                        best_sharp = candidates[cand_i][4]
+                        best_i = cand_i
+
+        # Widen search slightly when the local neighborhood hits a motion-blur burst
+        if best_sharp < blur_floor:
+            for offset in (-3, 3):
+                cand_i = center_i + offset
+                if 0 <= cand_i < n_cand and cand_i not in used:
+                    if abs(cum_mot[cand_i] - target) <= arc_step * 0.85 and candidates[cand_i][4] > best_sharp:
                         best_sharp = candidates[cand_i][4]
                         best_i = cand_i
 

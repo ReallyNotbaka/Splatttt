@@ -695,10 +695,10 @@ def _localize_non_anchor_frames_chained(
             if cancel_cb and cancel_cb():
                 break
             cands = []
-            if f > 0 and raw_poses[f - 1] is not None and ((f - 1) in chain_results or (f - 1) in anchor_world_obs):
-                cands.append(f - 1)
-            if f < n - 1 and raw_poses[f + 1] is not None and ((f + 1) in chain_results or (f + 1) in anchor_world_obs):
-                cands.append(f + 1)
+            for d_off in (-1, 1, -2, 2):
+                nb = f + d_off
+                if 0 <= nb < n and raw_poses[nb] is not None and (nb in chain_results or nb in anchor_world_obs):
+                    cands.append(nb)
 
             for neighbor in cands:
                 if neighbor in chain_results:
@@ -747,7 +747,7 @@ def _localize_non_anchor_frames_chained(
         for f in unreg_pass3:
             if cancel_cb and cancel_cb():
                 break
-            near_anchors = sorted(anchor_des_cache.keys(), key=lambda a: abs(a - f))[:2]
+            near_anchors = sorted(anchor_des_cache.keys(), key=lambda a: abs(a - f))[:4]
             if not near_anchors:
                 continue
 
@@ -1466,7 +1466,7 @@ def align_selected_depths(
         if is_outdoor:
             loss_a = F.smooth_l1_loss(torch.log(z_p), torch.log(sp_zc), beta=0.04) + b_reg_a * b_scalar.pow(2).mean()
         else:
-            loss_a = F.smooth_l1_loss(z_p, sp_zc, beta=0.04) + 0.15 * b_scalar.pow(2).mean()
+            loss_a = F.smooth_l1_loss(z_p, sp_zc, beta=0.04) + b_reg_a * b_scalar.pow(2).mean()
         loss_a.backward()
         opt_a.step()
 
@@ -1532,6 +1532,9 @@ def align_selected_depths(
                 and cos_d[k] > 0.65
                 and d_ti[k] <= (3.5 * d_sub_scale)
             ]
+            baseline_cands = [k for k in cands if d_ti[k] >= 0.08 * med_sub_step]
+            if len(baseline_cands) >= 2:
+                cands = baseline_cands
             if not cands:
                 continue
             pick_pos = [0, 2, 5, 9]
@@ -1767,8 +1770,13 @@ def align_selected_depths(
     if len(frame_errs) >= 12:
         glob_med_err = float(np.median(list(frame_errs.values())))
         err_cap = max(0.35, glob_med_err * 2.8) if scene_type == "outdoor" else max(0.18, glob_med_err * 2.5)
+        pass_frac = sum(1 for e in frame_errs.values() if e <= err_cap) / float(len(frame_errs))
         for k, idx in enumerate(selected_indices):
-            if frame_errs.get(idx, 0.0) <= err_cap:
+            if not poses[idx].valid:
+                continue
+            err_val = frame_errs.get(idx)
+            keep_view = (err_val <= err_cap) if (err_val is not None) else (pass_frac >= 0.5)
+            if keep_view:
                 keep_sub_indices.append(idx)
                 final_depths.append(aligned_depths_sub[k])
                 final_masks.append(masks_sub[k])

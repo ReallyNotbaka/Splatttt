@@ -186,15 +186,23 @@ class _SkyGridDome(nn.Module):
 
     def __init__(self, device: str = "cuda", h_bins: int = 12, w_bins: int = 24):
         super().__init__()
-        init_rgb = torch.tensor([0.68, 0.74, 0.82], dtype=torch.float32, device=device).view(1, 3, 1, 1)
-        init_logits = torch.log(init_rgb / (1.0 - init_rgb)).expand(1, 3, h_bins, w_bins).clone()
+        # Gentle horizon-to-zenith sky gradient prevents blown-out [1,1,1] zenith voids
+        t_el = torch.linspace(0.0, 1.0, h_bins, dtype=torch.float32, device=device).view(1, 1, h_bins, 1)
+        horizon_rgb = torch.tensor([0.76, 0.80, 0.85], dtype=torch.float32, device=device).view(1, 3, 1, 1)
+        zenith_rgb = torch.tensor([0.62, 0.72, 0.84], dtype=torch.float32, device=device).view(1, 3, 1, 1)
+        prior_rgb = ((1.0 - t_el) * horizon_rgb + t_el * zenith_rgb).expand(1, 3, h_bins, w_bins).clone()
+        self.register_buffer("prior_rgb", prior_rgb)
+        init_logits = torch.log(prior_rgb / (1.0 - prior_rgb)).clone()
         self.logits = nn.Parameter(init_logits)
 
     def smoothness_loss(self) -> torch.Tensor:
         padded = _sky_padded_rgb_from_logits(self.logits)
         dx = padded[:, :, :, 1:] - padded[:, :, :, :-1]
         dy = padded[:, :, 1:, :] - padded[:, :, :-1, :]
-        return dx.pow(2).mean() + dy.pow(2).mean()
+        h_half = padded.shape[2] // 2
+        upper_reg = 0.04 * (padded[:, :, h_half:, :-1] - self.prior_rgb[:, :, h_half:, :]).pow(2).mean()
+        bright_reg = 0.12 * F.relu(padded - 0.95).pow(2).mean()
+        return dx.pow(2).mean() + dy.pow(2).mean() + upper_reg + bright_reg
 
     @staticmethod
     def compute_view_uv_and_up(
@@ -246,7 +254,7 @@ def _eval_sky_bg_from_padded(
     sky = F.interpolate(sampled, size=(height, width), mode="bilinear", align_corners=False)[0].permute(1, 2, 0)
     ru = F.interpolate(rup.unsqueeze(1), size=(height, width), mode="bilinear", align_corners=False)[0, 0]
     hw = torch.clamp((ru + 0.04) / 0.14, 0.0, 1.0).unsqueeze(-1)
-    ground_col = torch.tensor([0.24, 0.26, 0.28], dtype=torch.float32, device=c2w_t.device)
+    ground_col = torch.tensor([0.36, 0.39, 0.37], dtype=torch.float32, device=c2w_t.device)
     return hw * sky + (1.0 - hw) * ground_col
 
 
@@ -718,6 +726,7 @@ def train_3dgs_scene(
     seed: int = 42,
     progress_cb: Optional[Callable[[float, str], None]] = None,
     cancel_cb: Optional[Callable[[], bool]] = None,
+    preview_cb: Optional[Callable[[np.ndarray], None]] = None,
     dense_xyz: Optional[np.ndarray] = None,
     dense_rgb: Optional[np.ndarray] = None,
     view_depths: Optional[Dict[int, Tuple[np.ndarray, np.ndarray]]] = None,
@@ -941,6 +950,7 @@ def train_3dgs_scene(
                 ch: int,
                 imgs_gpu_cur: Optional[torch.Tensor],
                 imgs_cpu_cur: List[np.ndarray],
+                need_depth_loss: bool = True,
             ) -> Tuple[List[torch.Tensor], Dict[int, torch.Tensor], Dict[int, torch.Tensor]]:
                 mw, mh = min(cw, 640), min(ch, 360)
                 sky_masks: List[torch.Tensor] = []
@@ -967,7 +977,7 @@ def train_3dgs_scene(
                     grad = gx_s + gy_s
                     smooth = grad < 0.05
                     ru = rup_full[vi]
-                    if vi in dd_tensors:
+                    if vi in dd_tensors and (need_depth_loss or sky_dome is not None):
                         dm_r = F.interpolate(
                             dd_tensors[vi][0][None, None], size=(mh, mw), mode="bilinear", align_corners=False
                         )[0, 0]
@@ -976,18 +986,28 @@ def train_3dgs_scene(
                             > 0.5
                         )
                         if sky_dome is not None:
+                            sky_depth_min = max(2.0, 3.2 * float(scene_scale))
+                            sky_halo_depth = max(1.6, 2.3 * float(scene_scale))
+                            high_sky_halo = (
+                                (ru > 0.10)
+                                & (gt_g > 0.86)
+                                & gt_bgr
+                                & (dm_r > sky_halo_depth)
+                                & (grad < 0.14)
+                            )
                             s_m = (
                                 (~mk_r)
                                 & (ru > 0.03)
-                                & (dm_r > 5.5)
+                                & (dm_r > sky_depth_min)
                                 & gt_bgr
                                 & (gt_g > 0.42)
                                 & (smooth | ((ru > 0.14) & (gt_g > 0.78) & (grad < 0.16)))
-                            )
+                            ) | high_sky_halo
                         else:
                             s_m = torch.zeros((mh, mw), dtype=torch.bool, device=device)
-                        disp_gt_s[vi] = 1.0 / dm_r.clamp(min=train_near_plane)
-                        mk_s[vi] = mk_r & smooth
+                        if need_depth_loss:
+                            disp_gt_s[vi] = 1.0 / dm_r.clamp(min=train_near_plane)
+                            mk_s[vi] = mk_r & smooth
                     else:
                         if sky_dome is not None:
                             s_m = (ru > 0.12) & gt_bgr & smooth & (gt_g > 0.90)
@@ -997,11 +1017,17 @@ def train_3dgs_scene(
                 return sky_masks, disp_gt_s, mk_s
 
             if eff_warmup > 0:
-                sky_stage, disp_gt_stage, mk_stage = _build_stage_masks(half_w, half_h, half_imgs_gpu, half_images)
+                sky_stage, disp_gt_stage, mk_stage = _build_stage_masks(
+                    half_w, half_h, half_imgs_gpu, half_images, need_depth_loss=True
+                )
             elif eff_mid > 0:
-                sky_stage, disp_gt_stage, mk_stage = _build_stage_masks(mid_w, mid_h, mid_imgs_gpu, mid_images)
+                sky_stage, disp_gt_stage, mk_stage = _build_stage_masks(
+                    mid_w, mid_h, mid_imgs_gpu, mid_images, need_depth_loss=True
+                )
             else:
-                sky_stage, disp_gt_stage, mk_stage = _build_stage_masks(width, height, full_imgs_gpu, views.images)
+                sky_stage, disp_gt_stage, mk_stage = _build_stage_masks(
+                    width, height, full_imgs_gpu, views.images, need_depth_loss=True
+                )
         else:
             uv_all = rup_all = None
             dd_tensors = {}
@@ -1015,12 +1041,33 @@ def train_3dgs_scene(
             else None
         )
 
+        # Hold out a small interior validation set on full runs for real novel-view PSNR telemetry
+        val_indices: List[int] = []
+        if is_full_run and num_views >= 24:
+            n_val = min(6, max(2, num_views // 20))
+            cand_val = np.linspace(1, num_views - 2, n_val, dtype=int)
+            val_indices = sorted({int(x) for x in cand_val})
+        val_set = set(val_indices)
+        train_view_pool = np.array(
+            [i for i in range(num_views) if i not in val_set] or list(range(num_views)),
+            dtype=np.int64,
+        )
+
+        # Per-camera exposure / white-balance affine compensation absorbs auto-exposure shifts
+        cam_exp_gain: Optional[torch.Tensor] = None
+        cam_exp_bias: Optional[torch.Tensor] = None
+        exp_opt: Optional[torch.optim.Optimizer] = None
+        if is_full_run:
+            cam_exp_gain = torch.zeros((num_views, 3), dtype=torch.float32, device=device, requires_grad=True)
+            cam_exp_bias = torch.zeros((num_views, 3), dtype=torch.float32, device=device, requires_grad=True)
+            exp_opt = torch.optim.Adam([cam_exp_gain, cam_exp_bias], lr=1.5e-3)
+
         if is_cuda:
             torch.cuda.reset_peak_memory_stats(device)
 
-        order = rng.permutation(num_views)
+        order = rng.permutation(train_view_pool)
         order_pos = 0
-        psnr_window = min(num_views, 40)
+        psnr_window = min(len(train_view_pool), 40)
         psnr_start_step = max(0, steps - psnr_window)
         mse_accum = torch.zeros((), dtype=torch.float32, device=device)
         mse_count = 0
@@ -1028,15 +1075,22 @@ def train_3dgs_scene(
         gt_ssim_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         gt_ssim_cache_bytes = 0
         gt_ssim_max_bytes = 600 * 1024 * 1024
+        seen_steps: Optional[torch.Tensor] = None
+        max_aniso_log = math.log(12.0)
+        preview_interval = max(250, int(steps) // 10)
+        preview_view_idx = min(num_views - 1, num_views // 2)
         t0 = time.perf_counter()
 
         for step in range(int(steps)):
             if step % 25 == 0 and cancel_cb and cancel_cb():
                 raise RuntimeError("build cancelled by user")
+            if is_full_run and step == int(refine_stop_iter) and (int(steps) - int(refine_stop_iter)) >= 100:
+                seen_steps = torch.zeros((params["means"].shape[0],), dtype=torch.int32, device=device)
             if eff_warmup > 0 and step == eff_warmup:
                 if half_imgs_gpu is not None:
                     del half_imgs_gpu
                     half_imgs_gpu = None
+                half_images = []
                 gt_ssim_cache.clear()
                 gt_ssim_cache_bytes = 0
                 if use_gpu_views:
@@ -1051,13 +1105,19 @@ def train_3dgs_scene(
                 if need_stage_masks:
                     del sky_stage, disp_gt_stage, mk_stage
                     if eff_mid > 0:
-                        sky_stage, disp_gt_stage, mk_stage = _build_stage_masks(mid_w, mid_h, mid_imgs_gpu, mid_images)
+                        sky_stage, disp_gt_stage, mk_stage = _build_stage_masks(
+                            mid_w, mid_h, mid_imgs_gpu, mid_images, need_depth_loss=True
+                        )
                     else:
-                        sky_stage, disp_gt_stage, mk_stage = _build_stage_masks(width, height, full_imgs_gpu, views.images)
+                        sky_stage, disp_gt_stage, mk_stage = _build_stage_masks(
+                            width, height, full_imgs_gpu, views.images, need_depth_loss=False
+                        )
+                        dd_tensors.clear()
             if eff_mid > 0 and step == eff_warmup + eff_mid:
                 if mid_imgs_gpu is not None:
                     del mid_imgs_gpu
                     mid_imgs_gpu = None
+                mid_images = []
                 gt_ssim_cache.clear()
                 gt_ssim_cache_bytes = 0
                 if use_gpu_views and full_imgs_gpu is None:
@@ -1066,10 +1126,13 @@ def train_3dgs_scene(
                     )
                 if need_stage_masks:
                     del sky_stage, disp_gt_stage, mk_stage
-                    sky_stage, disp_gt_stage, mk_stage = _build_stage_masks(width, height, full_imgs_gpu, views.images)
+                    sky_stage, disp_gt_stage, mk_stage = _build_stage_masks(
+                        width, height, full_imgs_gpu, views.images, need_depth_loss=False
+                    )
+                    dd_tensors.clear()
 
-            if order_pos >= num_views:
-                order = rng.permutation(num_views)
+            if order_pos >= len(order):
+                order = rng.permutation(train_view_pool)
                 order_pos = 0
             v_idx = int(order[order_pos])
             order_pos += 1
@@ -1161,8 +1224,22 @@ def train_3dgs_scene(
                 pred_hwc = fg_hwc
                 is_sky_low = None
 
-            l1 = F.l1_loss(pred_hwc, gt_hwc)
-            pred_chw = pred_hwc.permute(2, 0, 1).unsqueeze(0)
+            if cam_exp_gain is not None and cam_exp_bias is not None and step >= 200:
+                g_v = cam_exp_gain[v_idx].clamp(-0.30, 0.30).view(1, 1, 3)
+                b_v = cam_exp_bias[v_idx].clamp(-0.06, 0.06).view(1, 1, 3)
+                pred_phot = (pred_hwc * torch.exp(g_v) + b_v).clamp(0.0, 1.0)
+                exp_reg = (
+                    0.015 * cam_exp_gain.pow(2).mean()
+                    + 0.04 * cam_exp_bias.pow(2).mean()
+                    + 0.02 * cam_exp_gain.mean(dim=0).pow(2).sum()
+                    + 0.05 * cam_exp_bias.mean(dim=0).pow(2).sum()
+                )
+            else:
+                pred_phot = pred_hwc
+                exp_reg = 0.0
+
+            l1 = F.l1_loss(pred_phot, gt_hwc)
+            pred_chw = pred_phot.permute(2, 0, 1).unsqueeze(0)
             gt_chw = gt_hwc.permute(2, 0, 1).unsqueeze(0)
             if ssim_half_res and cur_w >= 900:
                 pred_ssim = F.avg_pool2d(pred_chw, kernel_size=2, stride=2)
@@ -1182,12 +1259,13 @@ def train_3dgs_scene(
             s_max = scales_act.max(dim=-1).values
             s_min = scales_act.min(dim=-1).values
             if is_full_run and d_cam_buf is not None:
-                aniso_reg = 0.008 * F.relu(s_max / s_min.clamp(min=1e-5) - 6.0).mean()
-                allowed_s = torch.clamp(0.06 * d_cam_buf, min=0.018, max=max(0.65, 0.55 * float(scene_scale)))
+                excess_aniso = F.relu(s_max / s_min.clamp(min=1e-5) - 6.0)
+                aniso_reg = 0.008 * excess_aniso.mean() + 0.002 * excess_aniso.pow(2).clamp(max=100.0).mean()
+                allowed_s = torch.clamp(0.05 * d_cam_buf, min=0.008, max=max(0.20, 0.32 * float(scene_scale)))
                 scale_reg = 0.015 * F.relu(s_max - allowed_s).mean()
                 opa_reg = 0.0002 * opacities_act.mean()
                 sh_reg = 0.001 * params["shN"].pow(2).mean() if params["shN"].numel() > 0 else 0.0
-                extra_reg: torch.Tensor | float = opa_reg + sh_reg + scale_reg
+                extra_reg: torch.Tensor | float = opa_reg + sh_reg + scale_reg + exp_reg
                 if sky_dome is not None:
                     extra_reg = extra_reg + 0.025 * (al_hw * is_sky.float()).mean() + 0.02 * sky_dome.smoothness_loss()
                 if ed_hw is not None and is_sky_low is not None:
@@ -1230,6 +1308,9 @@ def train_3dgs_scene(
             else:
                 visibility = (info["radii"] > 0).all(dim=-1).any(dim=0)
 
+            if seen_steps is not None and len(seen_steps) == n_gs:
+                seen_steps[visibility] += 1
+
             for p_name, opt in optimizers.items():
                 if params[p_name].grad is not None:
                     opt.step(visibility=visibility)
@@ -1237,6 +1318,13 @@ def train_3dgs_scene(
             if sky_opt is not None:
                 sky_opt.step()
                 sky_opt.zero_grad(set_to_none=True)
+            if exp_opt is not None:
+                if step >= 200:
+                    exp_opt.step()
+                exp_opt.zero_grad(set_to_none=True)
+                with torch.no_grad():
+                    cam_exp_gain.data.clamp_(-0.30, 0.30)
+                    cam_exp_bias.data.clamp_(-0.06, 0.06)
 
             with torch.no_grad():
                 params["scales"].data.clamp_(min=min_log_scale)
@@ -1257,14 +1345,68 @@ def train_3dgs_scene(
                 if is_full_run and (step % 100 == 0 or (d_cam_buf is not None and len(d_cam_buf) != params["means"].shape[0])):
                     d_cam_buf = _compute_nearest_cam_dist(params["means"].detach(), cam_centers_gpu)
                 with torch.no_grad():
+                    if is_full_run and step >= 400 and (step % 20 == 0):
+                        s_max_log = params["scales"].data.max(dim=-1, keepdim=True).values
+                        params["scales"].data.clamp_(min=(s_max_log - max_aniso_log))
                     params["scales"].data.clamp_(min=min_log_scale)
-            elif is_full_run and step % 200 == 0:
-                d_cam_buf = _compute_nearest_cam_dist(params["means"].detach(), cam_centers_gpu)
+            else:
+                if is_full_run and (step % 20 == 0 or step == int(steps) - 1):
+                    with torch.no_grad():
+                        s_max_log = params["scales"].data.max(dim=-1, keepdim=True).values
+                        params["scales"].data.clamp_(min=(s_max_log - max_aniso_log))
+                        params["scales"].data.clamp_(min=min_log_scale)
+                if is_full_run and step % 200 == 0:
+                    d_cam_buf = _compute_nearest_cam_dist(params["means"].detach(), cam_centers_gpu)
 
             if step >= psnr_start_step:
                 with torch.no_grad():
                     mse_accum += F.mse_loss(pred_hwc.detach().clamp(0.0, 1.0), gt_hwc)
                     mse_count += 1
+
+            if preview_cb is not None and (
+                (step > 0 and step % preview_interval == 0) or step == int(steps) - 1
+            ):
+                with torch.no_grad():
+                    pv_scale = min(1.0, 480.0 / float(max(width, height)))
+                    pv_w = max(64, int(round(width * pv_scale)) // 2 * 2)
+                    pv_h = max(64, int(round(height * pv_scale)) // 2 * 2)
+                    k_pv = k_gpu.clone()
+                    k_pv[:, 0, 0] *= float(pv_w) / float(width)
+                    k_pv[:, 0, 2] *= float(pv_w) / float(width)
+                    k_pv[:, 1, 1] *= float(pv_h) / float(height)
+                    k_pv[:, 1, 2] *= float(pv_h) / float(height)
+                    sh_pv = torch.cat([params["sh0"], params["shN"]], dim=1)
+                    pv_ren, pv_al, _ = rasterization(
+                        means=params["means"],
+                        quats=params["quats"],
+                        scales=torch.exp(params["scales"]),
+                        opacities=torch.sigmoid(params["opacities"]),
+                        colors=sh_pv,
+                        viewmats=viewmats_gpu[preview_view_idx : preview_view_idx + 1],
+                        Ks=k_pv,
+                        width=pv_w,
+                        height=pv_h,
+                        sh_degree=int(sh_degree),
+                        packed=False,
+                        near_plane=train_near_plane,
+                        far_plane=1e10,
+                        render_mode="RGB",
+                        rasterize_mode="antialiased",
+                    )
+                    pv_fg = pv_ren[0]
+                    if sky_dome is not None:
+                        pv_bg = _eval_sky_bg_from_padded(
+                            _sky_padded_rgb_from_logits(sky_dome.logits),
+                            c2ws_gpu[preview_view_idx],
+                            k_pv[0],
+                            pv_w,
+                            pv_h,
+                        )
+                        pv_fg = pv_fg + (1.0 - pv_al[0, :, :, 0]).unsqueeze(-1) * pv_bg
+                    pv_u8 = np.ascontiguousarray(
+                        (pv_fg.clamp(0.0, 1.0) * 255.0).round().to(torch.uint8).cpu().numpy()
+                    )
+                preview_cb(pv_u8)
 
             if progress_cb and (step % 200 == 0 or step == steps - 1):
                 frac = 0.2 + 0.78 * ((step + 1) / max(1, steps))
@@ -1313,7 +1455,8 @@ def train_3dgs_scene(
             cam_centers = views.c2ws[:, :3, 3].astype(np.float32)
             cam_centroid = np.mean(cam_centers, axis=0)
             means_np = params["means"].detach().cpu().numpy()
-            op_mask = (torch.sigmoid(params["opacities"]) >= 0.01).detach().cpu().numpy()
+            op_vals = torch.sigmoid(params["opacities"]).detach().cpu().numpy()
+            op_mask = op_vals >= 0.01
             dist_cent_mask = (
                 np.linalg.norm(means_np - cam_centroid[None, :], axis=1)
                 <= (40.0 * float(scene_scale))
@@ -1323,10 +1466,72 @@ def train_3dgs_scene(
             min_cam_d = (train_near_plane * 0.9) if is_full_run else (0.05 * float(scene_scale))
             cam_near_mask = d_cam >= min_cam_d
             keep_np = op_mask & dist_cent_mask & cam_near_mask
+            if is_full_run:
+                scales_np = torch.exp(params["scales"]).detach().cpu().numpy()
+                smax_np = scales_np.max(axis=1)
+                near_bloat = (d_cam < max(0.12, 0.20 * inv_scale)) & (smax_np > 0.25 * d_cam)
+                giant_out = smax_np > max(0.32, 0.48 * float(scene_scale))
+                keep_np = keep_np & (~near_bloat) & (~giant_out)
+                sh0_lum_np = np.clip(
+                    _SH_C0 * params["sh0"][:, 0, :].detach().cpu().numpy() + 0.5, 0.0, 1.0
+                ).mean(axis=1)
+                if sky_dome is not None:
+                    cam_cent_y = float(np.median(cam_centers[:, 1]))
+                    overhead_white = (
+                        (means_np[:, 1] < cam_cent_y - 0.35 * float(scene_scale))
+                        & (sh0_lum_np > 0.92)
+                        & (smax_np > 0.05 * max(0.7, float(scene_scale)))
+                    )
+                    keep_np = keep_np & (~overhead_white)
+                if seen_steps is not None and len(seen_steps) == len(means_np):
+                    seen_np = seen_steps.detach().cpu().numpy()
+                    min_hits = max(3, (int(steps) - int(refine_stop_iter)) // max(1, num_views * 3))
+                    low_hit_smear = (
+                        (seen_np <= min_hits)
+                        & (smax_np > max(0.045, 0.06 * float(scene_scale)))
+                        & ((op_vals < 0.35) | (sh0_lum_np > 0.78))
+                    )
+                    keep_np = keep_np & (~low_hit_smear)
             if int(keep_np.sum()) >= max(100, int(0.1 * len(keep_np))):
                 keep_t = torch.from_numpy(keep_np).to(device=device)
                 for p_name in ("means", "quats", "scales", "opacities", "sh0", "shN"):
                     params[p_name] = params[p_name].detach()[keep_t]
+
+        # Real holdout novel-view PSNR evaluated on interior views skipped from optimization
+        val_psnr_db: Optional[float] = None
+        if val_indices:
+            with torch.no_grad():
+                sh_val = torch.cat([params["sh0"], params["shN"]], dim=1)
+                sc_val = torch.exp(params["scales"])
+                op_val = torch.sigmoid(params["opacities"])
+                sky_pad_val = _sky_padded_rgb_from_logits(sky_dome.logits) if sky_dome is not None else None
+                val_scores: List[float] = []
+                for vi in val_indices:
+                    gt_v = torch.from_numpy(views.images[vi]).to(device=device, dtype=torch.float32) * inv_255
+                    ren_v, alp_v, _ = rasterization(
+                        means=params["means"],
+                        quats=params["quats"],
+                        scales=sc_val,
+                        opacities=op_val,
+                        colors=sh_val,
+                        viewmats=viewmats_gpu[vi : vi + 1],
+                        Ks=k_gpu,
+                        width=width,
+                        height=height,
+                        sh_degree=int(sh_degree),
+                        packed=packed,
+                        near_plane=train_near_plane,
+                        far_plane=1e10,
+                        render_mode="RGB",
+                        rasterize_mode="antialiased",
+                    )
+                    fg_v = ren_v[0]
+                    if sky_pad_val is not None:
+                        bg_v = _eval_sky_bg_from_padded(sky_pad_val, c2ws_gpu[vi], k_gpu[0], width, height)
+                        fg_v = fg_v + (1.0 - alp_v[0, :, :, 0]).unsqueeze(-1) * bg_v
+                    val_scores.append(compute_psnr_db(fg_v, gt_v))
+                if val_scores:
+                    val_psnr_db = float(np.mean(val_scores))
 
         store_dev = torch.device(device) if (keep_on_gpu and is_cuda) else torch.device("cpu")
         sky_logits_out = (
@@ -1348,12 +1553,14 @@ def train_3dgs_scene(
             peak_vram_gb=peak_vram_gb,
             train_s=train_s,
             train_psnr_db=train_psnr_db,
+            val_psnr_db=val_psnr_db,
             sky_logits=sky_logits_out,
         )
 
         del optimizers, strategy_state, params, viewmats_gpu, c2ws_gpu, cam_centers_gpu
         del k_gpu, k_half_gpu, k_mid_gpu, pin_full, pin_half, pin_mid
-        del full_imgs_gpu, half_imgs_gpu, mid_imgs_gpu, gt_ssim_cache
+        del full_imgs_gpu, half_imgs_gpu, mid_imgs_gpu, gt_ssim_cache, seen_steps
+        del cam_exp_gain, cam_exp_bias, exp_opt
         del sky_dome, sky_opt, uv_all, rup_all, dd_tensors, sky_stage, disp_gt_stage, mk_stage, d_cam_buf
 
         return scene
@@ -1371,8 +1578,9 @@ def render_view(
     width: int,
     height: int,
     device: str = "cuda",
+    rgba: bool = False,
 ) -> np.ndarray:
-    """Render an RGB uint8 image (H, W, 3) from a SplatScene and camera pose."""
+    """Render an RGB (or RGBA if rgba=True) uint8 image from a SplatScene and camera pose."""
     if not is_gsplat_available():
         raise RuntimeError("gsplat CUDA backend is not available")
     from gsplat import rasterization
@@ -1426,12 +1634,22 @@ def render_view(
         else max(0.04, min(0.10, 0.08 * inv_scale))
     )
 
+    if len(means_d) >= 500:
+        eye_d = c2w_t[:3, 3].to(device=device, dtype=torch.float32)
+        d_eye = torch.linalg.norm(means_d - eye_d.unsqueeze(0), dim=-1)
+        near_fade_lo = near_plane * 0.9
+        near_fade_hi = near_plane * 1.9
+        fade = torch.clamp((d_eye - near_fade_lo) / max(near_fade_hi - near_fade_lo, 1e-4), 0.0, 1.0)
+        opacities_render = opacities_d * fade
+    else:
+        opacities_render = opacities_d
+
     k_dev = k_t.to(device)
     renders, alphas, _info = rasterization(
         means=means_d,
         quats=quats_d,
         scales=scales_d,
-        opacities=opacities_d,
+        opacities=opacities_render,
         colors=sh_coeffs,
         viewmats=viewmat_t.unsqueeze(0).to(device),
         Ks=k_dev.unsqueeze(0),
@@ -1452,12 +1670,27 @@ def render_view(
         )
         fg = fg + (1.0 - alphas[0, :, :, 0]).unsqueeze(-1) * bg
 
-    rgb = fg.clamp(0.0, 1.0) * 255.0
-    return np.ascontiguousarray(rgb.round().to(torch.uint8).cpu().numpy())
+    rgb_u8 = (fg.clamp(0.0, 1.0) * 255.0).round().to(torch.uint8)
+    if rgba:
+        alpha_u8 = torch.full((int(height), int(width), 1), 255, dtype=torch.uint8, device=rgb_u8.device)
+        return np.ascontiguousarray(torch.cat([rgb_u8, alpha_u8], dim=-1).cpu().numpy())
+    return np.ascontiguousarray(rgb_u8.cpu().numpy())
 
 
-def export_splats_ply(splat_scene: SplatScene, output_path: str | Path) -> Path:
-    """Export SplatScene to a standard binary little-endian 3DGS .ply file."""
+def _splat_meta_path(ply_path: Path) -> Path:
+    return ply_path.with_suffix(".splatmeta.npz")
+
+
+def export_splats_ply(
+    splat_scene: SplatScene,
+    output_path: str | Path,
+    *,
+    poses: Optional[Sequence[CameraPose]] = None,
+    intrinsics: Optional[np.ndarray] = None,
+    frame_size: Optional[Tuple[int, int]] = None,
+    save_meta: bool = True,
+) -> Path:
+    """Export SplatScene to a standard binary little-endian 3DGS .ply file (plus optional .splatmeta.npz)."""
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1506,4 +1739,251 @@ def export_splats_ply(splat_scene: SplatScene, output_path: str | Path) -> Path:
         if n_valid > 0:
             f.write(table.tobytes())
 
+    has_extra_meta = (
+        splat_scene.sky_logits is not None
+        or poses is not None
+        or splat_scene.val_psnr_db is not None
+    )
+    if save_meta and has_extra_meta:
+        meta_kwargs: Dict[str, Any] = {
+            "scene_scale": np.array(float(splat_scene.scene_scale), dtype=np.float32),
+            "sh_degree": np.array(int(splat_scene.sh_degree), dtype=np.int32),
+            "init_splats": np.array(int(splat_scene.init_splats), dtype=np.int32),
+            "final_splats": np.array(n_valid, dtype=np.int32),
+            "peak_vram_gb": np.array(float(splat_scene.peak_vram_gb), dtype=np.float32),
+            "train_s": np.array(float(splat_scene.train_s), dtype=np.float32),
+            "train_psnr_db": np.array(float(splat_scene.train_psnr_db), dtype=np.float32),
+        }
+        if splat_scene.val_psnr_db is not None:
+            meta_kwargs["val_psnr_db"] = np.array(float(splat_scene.val_psnr_db), dtype=np.float32)
+        if splat_scene.sky_logits is not None:
+            meta_kwargs["sky_logits"] = splat_scene.sky_logits.detach().cpu().numpy().astype(np.float32)
+        if poses:
+            meta_kwargs["poses_r"] = np.stack([np.asarray(p.r_wc, dtype=np.float32) for p in poses], axis=0)
+            meta_kwargs["poses_t"] = np.stack([np.asarray(p.t_wc, dtype=np.float32) for p in poses], axis=0)
+            meta_kwargs["poses_v"] = np.array([bool(p.valid) for p in poses], dtype=bool)
+        if intrinsics is not None:
+            meta_kwargs["intrinsics"] = np.asarray(intrinsics, dtype=np.float32)
+        if frame_size is not None:
+            meta_kwargs["frame_size"] = np.array([int(frame_size[0]), int(frame_size[1])], dtype=np.int32)
+        np.savez(_splat_meta_path(out), **meta_kwargs)
+
     return out
+
+
+def export_splats_dot_splat(splat_scene: SplatScene, output_path: str | Path) -> Path:
+    """Export SplatScene to compact 32-byte/splat antimatter15 .splat binary format."""
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    means = splat_scene.means.detach().cpu().numpy().astype(np.float32, copy=False)
+    scales = np.exp(splat_scene.scales.detach().cpu().numpy().astype(np.float32, copy=False))
+    op_logit = splat_scene.opacities.detach().cpu().numpy().reshape(-1).astype(np.float32, copy=False)
+    alpha = 1.0 / (1.0 + np.exp(-np.clip(op_logit, -20.0, 20.0)))
+    sh0 = splat_scene.sh0.detach().cpu().numpy().reshape(-1, 3).astype(np.float32, copy=False)
+    rgb = np.clip(_SH_C0 * sh0 + 0.5, 0.0, 1.0)
+    rgba = np.clip(np.round(np.concatenate([rgb, alpha[:, None]], axis=1) * 255.0), 0.0, 255.0).astype(np.uint8)
+
+    quats = splat_scene.quats.detach().cpu().numpy().reshape(-1, 4).astype(np.float32, copy=False)
+    q_norm = np.linalg.norm(quats, axis=1, keepdims=True)
+    quats = np.where(q_norm > 1e-8, quats / np.maximum(q_norm, 1e-8), np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+    q_u8 = np.clip(np.round(quats * 128.0 + 128.0), 0.0, 255.0).astype(np.uint8)
+
+    finite = np.isfinite(means).all(axis=1) & np.isfinite(scales).all(axis=1) & np.isfinite(alpha)
+    means, scales, rgba, q_u8, alpha = means[finite], scales[finite], rgba[finite], q_u8[finite], alpha[finite]
+    vol = np.prod(np.maximum(scales, 1e-8), axis=1)
+    order = np.argsort(-(alpha * vol))
+
+    rec_dtype = np.dtype([("pos", "<f4", 3), ("scale", "<f4", 3), ("rgba", "u1", 4), ("rot", "u1", 4)])
+    buf = np.empty(len(order), dtype=rec_dtype)
+    if len(order) > 0:
+        buf["pos"] = means[order]
+        buf["scale"] = scales[order]
+        buf["rgba"] = rgba[order]
+        buf["rot"] = q_u8[order]
+    out.write_bytes(buf.tobytes())
+    return out
+
+
+def load_splats_ply(
+    ply_path: str | Path,
+    device: Optional[str] = None,
+) -> Tuple[SplatScene, Optional[List[CameraPose]], Optional[np.ndarray], Optional[Tuple[int, int]]]:
+    """Load a binary little-endian 3DGS .ply file (and companion .splatmeta.npz if present)."""
+    path = Path(ply_path)
+    raw = path.read_bytes()
+    marker = b"end_header\n"
+    idx = raw.find(marker)
+    if idx < 0:
+        marker = b"end_header\r\n"
+        idx = raw.find(marker)
+    if idx < 0:
+        raise ValueError(f"Invalid PLY header in {path}")
+
+    header = raw[:idx].decode("ascii", errors="replace")
+    payload = raw[idx + len(marker) :]
+    if "format binary_little_endian 1.0" not in header:
+        raise ValueError(f"Only binary_little_endian 3DGS PLY is supported: {path}")
+
+    ply_types = {
+        "float": "<f4",
+        "float32": "<f4",
+        "double": "<f8",
+        "float64": "<f8",
+        "uchar": "u1",
+        "uint8": "u1",
+        "int": "<i4",
+        "int32": "<i4",
+        "uint": "<u4",
+        "uint32": "<u4",
+        "short": "<i2",
+        "ushort": "<u2",
+    }
+    n_verts = 0
+    in_vertex = False
+    fields: List[Tuple[str, str]] = []
+    for line in header.splitlines():
+        parts = line.strip().split()
+        if not parts:
+            continue
+        if parts[0] == "element":
+            in_vertex = (len(parts) >= 3 and parts[1] == "vertex")
+            if in_vertex:
+                n_verts = int(parts[2])
+        elif parts[0] == "property" and in_vertex and len(parts) >= 3:
+            dt = ply_types.get(parts[1])
+            if dt is None:
+                raise ValueError(f"Unsupported PLY property type '{parts[1]}' in {path}")
+            fields.append((parts[2], dt))
+
+    if not fields or n_verts <= 0:
+        raise ValueError(f"No splat vertices found in {path}")
+
+    rec_dtype = np.dtype(fields)
+    expected_bytes = n_verts * rec_dtype.itemsize
+    if len(payload) < expected_bytes:
+        raise ValueError(f"Truncated PLY payload in {path}: expected {expected_bytes}, got {len(payload)}")
+
+    arr = np.frombuffer(payload[:expected_bytes], dtype=rec_dtype)
+    names = set(fields[i][0] for i in range(len(fields)))
+    for req in ("x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2", "opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"):
+        if req not in names:
+            raise ValueError(f"PLY file is missing 3DGS property '{req}': {path}")
+
+    means_np = np.stack([arr["x"], arr["y"], arr["z"]], axis=1).astype(np.float32)
+    f_dc_np = np.stack([arr["f_dc_0"], arr["f_dc_1"], arr["f_dc_2"]], axis=1).astype(np.float32)[:, None, :]
+    opac_np = np.asarray(arr["opacity"], dtype=np.float32)
+    scales_np = np.stack([arr["scale_0"], arr["scale_1"], arr["scale_2"]], axis=1).astype(np.float32)
+    quats_np = np.stack([arr["rot_0"], arr["rot_1"], arr["rot_2"], arr["rot_3"]], axis=1).astype(np.float32)
+
+    rest_names = [f"f_rest_{i}" for i in range(45) if f"f_rest_{i}" in names]
+    k_rest_total = len(rest_names) // 3
+    if k_rest_total > 0:
+        rest_flat = np.stack([arr[name] for name in rest_names[: k_rest_total * 3]], axis=1).astype(np.float32)
+        sh_n_np = np.transpose(rest_flat.reshape(n_verts, 3, k_rest_total), (0, 2, 1)).astype(np.float32)
+        if k_rest_total >= 15 and float(np.abs(sh_n_np[:, 8:, :]).max()) > 1e-6:
+            sh_deg = 3
+            sh_n_np = sh_n_np[:, :15, :]
+        elif k_rest_total >= 8 and float(np.abs(sh_n_np[:, :8, :]).max()) > 1e-6:
+            sh_deg = 2
+            sh_n_np = sh_n_np[:, :8, :]
+        elif k_rest_total >= 3 and float(np.abs(sh_n_np[:, :3, :]).max()) > 1e-6:
+            sh_deg = 1
+            sh_n_np = sh_n_np[:, :3, :]
+        else:
+            sh_deg = 0
+            sh_n_np = np.zeros((n_verts, 0, 3), dtype=np.float32)
+    else:
+        sh_deg = 0
+        sh_n_np = np.zeros((n_verts, 0, 3), dtype=np.float32)
+
+    valid = (
+        np.isfinite(means_np).all(axis=1)
+        & np.isfinite(f_dc_np).all(axis=(1, 2))
+        & np.isfinite(opac_np)
+        & np.isfinite(scales_np).all(axis=1)
+        & np.isfinite(quats_np).all(axis=1)
+    )
+    means_np, f_dc_np, opac_np, scales_np, quats_np, sh_n_np = (
+        means_np[valid],
+        f_dc_np[valid],
+        opac_np[valid],
+        scales_np[valid],
+        quats_np[valid],
+        sh_n_np[valid],
+    )
+
+    target_dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    p5 = np.percentile(means_np, 5, axis=0)
+    p95 = np.percentile(means_np, 95, axis=0)
+    est_scale = max(float(np.linalg.norm(p95 - p5)) * 0.35, 0.5)
+
+    meta_p = _splat_meta_path(path)
+    poses_out: Optional[List[CameraPose]] = None
+    intrinsics_out: Optional[np.ndarray] = None
+    frame_size_out: Optional[Tuple[int, int]] = None
+    sky_logits_t: Optional[torch.Tensor] = None
+    train_psnr = 0.0
+    val_psnr: Optional[float] = None
+    train_s = 0.0
+    peak_vram = 0.0
+    init_splats = int(len(means_np))
+
+    if meta_p.exists():
+        meta = np.load(meta_p, allow_pickle=False)
+        if "scene_scale" in meta:
+            est_scale = float(meta["scene_scale"])
+        if "sh_degree" in meta:
+            meta_deg = int(meta["sh_degree"])
+            need_k = (meta_deg + 1) ** 2 - 1
+            if need_k <= k_rest_total:
+                sh_deg = meta_deg
+                sh_n_np = (
+                    sh_n_np[:, :need_k, :]
+                    if need_k > 0
+                    else np.zeros((len(means_np), 0, 3), dtype=np.float32)
+                )
+        if "sky_logits" in meta:
+            sky_logits_t = torch.from_numpy(np.asarray(meta["sky_logits"], dtype=np.float32)).to(target_dev).contiguous()
+        if "train_psnr_db" in meta:
+            train_psnr = float(meta["train_psnr_db"])
+        if "val_psnr_db" in meta:
+            val_psnr = float(meta["val_psnr_db"])
+        if "train_s" in meta:
+            train_s = float(meta["train_s"])
+        if "peak_vram_gb" in meta:
+            peak_vram = float(meta["peak_vram_gb"])
+        if "init_splats" in meta:
+            init_splats = int(meta["init_splats"])
+        if "poses_r" in meta and "poses_t" in meta:
+            r_arr = meta["poses_r"]
+            t_arr = meta["poses_t"]
+            v_arr = meta["poses_v"] if "poses_v" in meta else np.ones(len(r_arr), dtype=bool)
+            poses_out = [
+                CameraPose(r_wc=r_arr[i], t_wc=t_arr[i], valid=bool(v_arr[i]))
+                for i in range(len(r_arr))
+            ]
+        if "intrinsics" in meta:
+            intrinsics_out = np.asarray(meta["intrinsics"], dtype=np.float32)
+        if "frame_size" in meta:
+            fs = meta["frame_size"]
+            frame_size_out = (int(fs[0]), int(fs[1]))
+
+    sc = SplatScene(
+        means=torch.from_numpy(np.ascontiguousarray(means_np)).to(target_dev),
+        quats=torch.from_numpy(np.ascontiguousarray(quats_np)).to(target_dev),
+        scales=torch.from_numpy(np.ascontiguousarray(scales_np)).to(target_dev),
+        opacities=torch.from_numpy(np.ascontiguousarray(opac_np)).to(target_dev),
+        sh0=torch.from_numpy(np.ascontiguousarray(f_dc_np)).to(target_dev),
+        shN=torch.from_numpy(np.ascontiguousarray(sh_n_np)).to(target_dev),
+        sh_degree=int(sh_deg),
+        scene_scale=float(est_scale),
+        init_splats=init_splats,
+        final_splats=int(len(means_np)),
+        peak_vram_gb=peak_vram,
+        train_s=train_s,
+        train_psnr_db=train_psnr,
+        val_psnr_db=val_psnr,
+        sky_logits=sky_logits_t,
+    )
+    return sc, poses_out, intrinsics_out, frame_size_out

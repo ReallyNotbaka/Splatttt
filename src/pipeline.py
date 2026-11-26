@@ -182,7 +182,17 @@ class VideoTo3DPipeline:
         cols_list: list[np.ndarray] = []
         per_frame_cap = max(800, 65_000 // max(1, len(sub_orig)))
         is_outdoor = str(scene_type).lower() == "outdoor"
-        z_max_dense = 7.0 if is_outdoor else 8.0
+        cam_pts_valid = np.asarray([poses[i].t_wc for i in valid_idx], dtype=np.float32)
+        cam_span_r = max(
+            0.4,
+            float(np.max(np.linalg.norm(cam_pts_valid - cam_pts_valid.mean(axis=0, keepdims=True), axis=1))) * 1.1,
+        )
+        z_max_dense = (
+            float(np.clip(5.0 * cam_span_r, 3.0, 14.0))
+            if is_outdoor
+            else float(np.clip(5.5 * cam_span_r, 3.0, 12.0))
+        )
+        sky_dm_min = max(1.6, 2.3 * cam_span_r)
         erode_kern = np.ones((5, 5), dtype=np.uint8)
         rng = np.random.default_rng(7)
         for k_sub, f_idx in enumerate(sub_orig):
@@ -194,7 +204,12 @@ class VideoTo3DPipeline:
                 # Filter sky/horizon boundary leaks so DA3 dense points stay on solid near/mid surfaces
                 rc_y = r_wc[1, 0] * rx + r_wc[1, 1] * ry + r_wc[1, 2]
                 im01 = rgb_for_pts[f_idx].astype(np.float32) * (1.0 / 255.0)
-                sky_like = (rc_y < -0.02) & (im01[..., 2] >= im01[..., 0] - 0.03) & (im01.mean(axis=-1) > 0.42) & (dm > 3.5)
+                sky_like = (
+                    (rc_y < -0.02)
+                    & (im01[..., 2] >= im01[..., 0] - 0.03)
+                    & (im01.mean(axis=-1) > 0.42)
+                    & (dm > sky_dm_min)
+                )
                 mk = mk & (~sky_like)
             mk = mk & (dm > 0.12) & (dm < z_max_dense)
             ys_v, xs_v = np.where(mk)
@@ -224,6 +239,7 @@ class VideoTo3DPipeline:
         config: Optional[ReconstructionConfig] = None,
         progress_cb: Optional[Callable[[float, str], None]] = None,
         cancel_cb: Optional[Callable[[], bool]] = None,
+        preview_cb: Optional[Callable[[np.ndarray], None]] = None,
     ) -> ReconstructionResult:
         cfg = config or ReconstructionConfig()
         target_device = cfg.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -354,20 +370,27 @@ class VideoTo3DPipeline:
                 device=target_device,
                 progress_cb=_train_prog,
                 cancel_cb=cancel_cb,
+                preview_cb=preview_cb,
                 dense_xyz=dense_xyz,
                 dense_rgb=dense_rgb,
                 view_depths=view_depths,
             )
             _check_cancel()
 
+            h_fr, w_fr = video_data.frames[0].rgb.shape[:2]
             if progress_cb:
                 progress_cb(0.97, "Exporting 3DGS splats (scene_splats.ply)...")
             out_dir = Path(cfg.out_dir or "outputs")
-            splat_ply_path = export_splats_ply(splat_scene, out_dir / "scene_splats.ply")
+            splat_ply_path = export_splats_ply(
+                splat_scene,
+                out_dir / "scene_splats.ply",
+                poses=poses,
+                intrinsics=k_mat,
+                frame_size=(int(w_fr), int(h_fr)),
+            )
             if progress_cb:
                 progress_cb(1.0, "3DGS reconstruction complete")
 
-            h_fr, w_fr = video_data.frames[0].rgb.shape[:2]
             scene = Scene3D(
                 points=np.ascontiguousarray(xyz, dtype=np.float32),
                 colors=np.ascontiguousarray(rgb, dtype=np.uint8),

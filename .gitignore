@@ -1,0 +1,36 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environment & Dependencies
+.venv/
+venv/
+ENV/
+env/
+
+# Pytest / Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# Large output files, scene caches, and exported meshes
+outputs/
+*.mp4
+*.glb
+*.ply
+*.npz
+*.obj
+*.txt
+
+# Scratch & temporary workspace files
+scratch/
+*.log
+
+# OS & IDE metadata
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

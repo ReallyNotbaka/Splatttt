@@ -297,3 +297,36 @@ def test_depth_engine_device_flag():
         eng_c0 = DepthEngine(device="cuda:0")
         assert eng_c0._is_cuda is True
         assert eng_c0.dtype == torch.float16
+
+
+def test_align_selected_depths_drops_invalid_poses_without_sparse_obs():
+    from src.pose_tracker import align_selected_depths
+    from src.video_ingest import VideoFrame
+
+    h, w = 32, 32
+    k_mat = np.array([[30.0, 0.0, 16.0], [0.0, 30.0, 16.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+    frames = [VideoFrame(index=i, timestamp=float(i) * 0.1, rgb=np.zeros((h, w, 3), dtype=np.uint8), sharpness=10.0) for i in range(14)]
+    depths = [np.full((h, w), 2.0, dtype=np.float32) for _ in range(14)]
+    masks = [np.ones((h, w), dtype=bool) for _ in range(14)]
+    poses = [
+        CameraPose(r_wc=np.eye(3), t_wc=np.array([float(i) * 0.1, 0.0, 0.0]), valid=(i != 13))
+        for i in range(14)
+    ]
+    uv = np.stack([np.linspace(4, 28, 12), np.linspace(4, 28, 12)], axis=1).astype(np.float32)
+    sparse_obs = {i: (uv, np.full(12, 2.0, dtype=np.float32)) for i in range(13)}
+
+    _, _, keep = align_selected_depths(
+        frames=frames,
+        selected_indices=list(range(14)),
+        depths_sub=depths,
+        masks_sub=masks,
+        poses=poses,
+        sparse_obs=sparse_obs,
+        k_mat=k_mat,
+        k1_cal=0.0,
+        device="cpu",
+        use_grid_warp=False,
+    )
+    assert 13 not in keep
+    assert len(keep) == 13
+

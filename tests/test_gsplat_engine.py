@@ -660,3 +660,227 @@ def test_build_3dgs_depth_priors_preserves_pose_scale():
     assert len(dense_xyz) > 0 and np.all(np.isfinite(dense_xyz))
 
 
+def test_splat_orbit_camera_prevents_underground_floor_clip():
+    cam = SplatOrbitCamera()
+    world_up = np.array([0.0, -1.0, 0.0], dtype=np.float32)
+
+    poses = []
+    for i in range(16):
+        ang = 2.0 * np.pi * i / 16.0
+        eye = np.array([0.5 * np.cos(ang), 0.0, 0.5 * np.sin(ang)], dtype=np.float64)
+        fwd = (-eye / np.linalg.norm(eye)).astype(np.float32)
+        right = np.cross(fwd, world_up)
+        right /= np.linalg.norm(right)
+        down = np.cross(fwd, right)
+        r_wc = np.stack([right, down, fwd], axis=1).astype(np.float64)
+        poses.append(CameraPose(r_wc=r_wc, t_wc=eye, valid=True))
+
+    rng = np.random.default_rng(19)
+    floor_pts = np.stack(
+        [rng.uniform(-0.8, 0.8, 300), np.full(300, 0.28, dtype=np.float32), rng.uniform(-0.8, 0.8, 300)],
+        axis=-1,
+    ).astype(np.float32)
+    statue_pts = rng.uniform([-0.15, -0.35, -0.15], [0.15, 0.25, 0.15], size=(120, 3)).astype(np.float32)
+    pts = np.concatenate([floor_pts, statue_pts], axis=0)
+
+    cam.set_overview(pts, poses)
+    assert cam._floor_y is not None
+    assert cam.target[1] < 0.20
+
+    # Steep downward mouse drag (negative pitch) must not punch eye below floor_y
+    cam.set_from_pose(poses[0], look_dist=0.55)
+    cam.orbit(40.0, -1200.0)
+    eye_y = float(cam.get_c2w()[1, 3])
+    assert eye_y <= cam._floor_y - cam._floor_margin + 1e-4
+
+    # Flying straight downward must also stop cleanly above the ground plane
+    for _ in range(40):
+        cam.fly(0.0, 0.0, -1.0)
+    assert float(cam.get_c2w()[1, 3]) <= cam._floor_y - cam._floor_margin + 1e-4
+
+
+@pytest.mark.skipif(not is_gsplat_available(), reason="gsplat CUDA backend unavailable")
+def test_render_view_near_lens_dissolve_and_aniso_cap():
+    width, height = 64, 64
+    k_mat = np.array([[60.0, 0.0, 32.0], [0.0, 60.0, 32.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+    n_pts = 600
+    rng = np.random.default_rng(23)
+    means = rng.uniform(-0.8, 0.8, size=(n_pts, 3)).astype(np.float32)
+    # Keep background splats strictly behind z=0.5 so they trigger >=500 fade without occluding the test blob
+    means[1:, 2] = rng.uniform(0.5, 1.0, size=n_pts - 1).astype(np.float32)
+    # Place point 0 right inside the near lens (z = 0.06 vs camera at origin) colored bright red
+    means[0] = np.array([0.0, 0.0, 0.06], dtype=np.float32)
+    quats = np.tile(np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32), (n_pts, 1))
+    scales = np.full((n_pts, 3), np.log(0.05), dtype=np.float32)
+    opacities = np.full((n_pts,), 4.0, dtype=np.float32)
+    sh0 = np.full((n_pts, 1, 3), -1.77, dtype=np.float32)
+    sh0[0, 0] = np.array([1.77, -1.77, -1.77], dtype=np.float32)
+    shN = np.zeros((n_pts, 8, 3), dtype=np.float32)
+
+    sc = SplatScene(
+        means=torch.from_numpy(means),
+        quats=torch.from_numpy(quats),
+        scales=torch.from_numpy(scales),
+        opacities=torch.from_numpy(opacities),
+        sh0=torch.from_numpy(sh0),
+        shN=torch.from_numpy(shN),
+        sh_degree=2,
+        scene_scale=1.0,
+        final_splats=n_pts,
+    )
+    rendered = render_view(sc, c2w=np.eye(4, dtype=np.float32), K=k_mat, width=width, height=height)
+    # Near-lens red blob at z=0.06 (< near_fade_lo = 0.072) should fade out instead of filling center bright red
+    assert int(rendered[height // 2, width // 2, 0]) < 30
+
+    # Moving the red blob cleanly outside the near-fade zone should render bright red at center
+    sc._render_cache = None
+    sc.means[0] = torch.tensor([0.0, 0.0, 0.25], dtype=torch.float32)
+    rendered_far = render_view(sc, c2w=np.eye(4, dtype=np.float32), K=k_mat, width=width, height=height)
+    assert int(rendered_far[height // 2, width // 2, 0]) > 200
+    rgba_far = render_view(sc, c2w=np.eye(4, dtype=np.float32), K=k_mat, width=width, height=height, rgba=True)
+    assert rgba_far.shape == (height, width, 4) and np.all(rgba_far[..., 3] == 255)
+    sc.release()
+
+
+@pytest.mark.skipif(not is_gsplat_available(), reason="gsplat CUDA backend unavailable")
+def test_load_splats_ply_and_dot_splat_and_gui_reload(tmp_path: Path):
+    import sys
+    import cv2
+    from PySide6.QtWidgets import QApplication
+    from src.gsplat_engine import export_splats_dot_splat, load_splats_ply
+    from src.native_viewer import Native3DWindow, configure_hidpi
+
+    n_pts = 20
+    torch.manual_seed(13)
+    means = torch.randn((n_pts, 3), dtype=torch.float32) * 0.4
+    quats = torch.tile(torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.float32), (n_pts, 1))
+    scales = torch.full((n_pts, 3), -2.2, dtype=torch.float32)
+    opacities = torch.full((n_pts,), 1.5, dtype=torch.float32)
+    sh0 = torch.randn((n_pts, 1, 3), dtype=torch.float32) * 0.4
+    shN = torch.randn((n_pts, 8, 3), dtype=torch.float32) * 0.05
+    sky = torch.zeros((1, 3, 12, 24), dtype=torch.float32)
+    sky[0, 2] = 0.6
+
+    sc = SplatScene(
+        means=means,
+        quats=quats,
+        scales=scales,
+        opacities=opacities,
+        sh0=sh0,
+        shN=shN,
+        sh_degree=2,
+        scene_scale=1.35,
+        init_splats=n_pts,
+        final_splats=n_pts,
+        train_psnr_db=22.5,
+        val_psnr_db=21.2,
+        sky_logits=sky,
+    )
+    poses = [CameraPose(r_wc=np.eye(3), t_wc=np.array([0.0, 0.0, float(i) * 0.2 - 1.5]), valid=True) for i in range(6)]
+    k_mat = np.array([[400.0, 0.0, 320.0], [0.0, 400.0, 180.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+
+    ply_p = export_splats_ply(sc, tmp_path / "saved_scene.ply", poses=poses, intrinsics=k_mat, frame_size=(640, 360))
+    assert (tmp_path / "saved_scene.splatmeta.npz").exists()
+
+    loaded_sc, l_poses, l_k, l_fsz = load_splats_ply(ply_p, device="cuda")
+    assert loaded_sc.final_splats == n_pts
+    assert loaded_sc.sh_degree == 2
+    assert loaded_sc.scene_scale == pytest.approx(1.35, abs=1e-4)
+    assert loaded_sc.val_psnr_db == pytest.approx(21.2, abs=1e-4)
+    assert loaded_sc.sky_logits is not None and loaded_sc.sky_logits.shape == (1, 3, 12, 24)
+    assert l_poses is not None and len(l_poses) == 6
+    assert l_k is not None and l_fsz == (640, 360)
+
+    dot_splat = export_splats_dot_splat(loaded_sc, tmp_path / "saved_scene.splat")
+    assert dot_splat.exists() and dot_splat.stat().st_size == n_pts * 32
+
+    configure_hidpi()
+    app = QApplication.instance() or QApplication(sys.argv)
+    win = Native3DWindow(presets_path=tmp_path / "p.json")
+    win.load_saved_scene_file(ply_p)
+    assert win.current_result is not None and win.current_result.splat_scene is not None
+    assert win.viewport_stack.currentIndex() == 1
+
+    snap = win.export_snapshot_png(tmp_path / "snap.png")
+    assert snap is not None and snap.exists() and snap.stat().st_size > 100
+    snap_img = cv2.imread(str(snap))
+    assert snap_img is not None and snap_img.shape[:2] == (900, 1600)
+    tt = win.export_turntable_mp4(tmp_path / "turntable.mp4", n_frames=12, fps=12)
+    assert tt is not None and tt.exists() and tt.stat().st_size > 500
+    cap = cv2.VideoCapture(str(tt))
+    assert int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) >= 10
+    cap.release()
+
+    win.close()
+    app.processEvents()
+    loaded_sc.release()
+    sc.release()
+
+
+@pytest.mark.skipif(not is_gsplat_available(), reason="gsplat CUDA backend unavailable")
+def test_train_3dgs_scene_exposure_holdout_val_psnr_and_preview():
+    width, height = 640, 360
+    k_mat = np.array(
+        [[460.0, 0.0, 320.0], [0.0, 460.0, 180.0], [0.0, 0.0, 1.0]],
+        dtype=np.float32,
+    )
+    poses, images, c2ws, viewmats = [], [], [], []
+    n_views = 24
+    for i in range(n_views):
+        ang = 2.0 * np.pi * i / float(n_views)
+        eye = np.array([1.8 * np.cos(ang), 0.0, 1.8 * np.sin(ang)], dtype=np.float32)
+        fwd = -eye / np.linalg.norm(eye)
+        right = np.cross(fwd, np.array([0.0, -1.0, 0.0], dtype=np.float32))
+        right /= np.linalg.norm(right)
+        down = np.cross(fwd, right)
+        r_wc = np.stack([right, down, fwd], axis=1).astype(np.float64)
+        poses.append(CameraPose(r_wc=r_wc, t_wc=eye.astype(np.float64), valid=True))
+        c2w = np.eye(4, dtype=np.float32)
+        c2w[:3, :3] = r_wc.astype(np.float32)
+        c2w[:3, 3] = eye
+        c2ws.append(c2w)
+        viewmats.append(np.linalg.inv(c2w))
+        # Vary camera brightness +/-15% per view to test exposure compensation
+        gain = 1.0 + 0.15 * np.sin(ang * 2.0)
+        im = np.full((height, width, 3), int(np.clip(145 * gain, 20, 240)), dtype=np.uint8)
+        im[140:220, 260:380] = np.array([min(255, int(75 * gain)), min(255, int(135 * gain)), min(255, int(90 * gain))], dtype=np.uint8)
+        images.append(im)
+
+    views = TrainingViews(
+        images=images,
+        c2ws=np.stack(c2ws, axis=0),
+        viewmats=np.stack(viewmats, axis=0),
+        K=k_mat,
+        width=width,
+        height=height,
+        frame_indices=list(range(n_views)),
+    )
+    rng = np.random.default_rng(17)
+    xyz = rng.uniform(-0.35, 0.35, size=(600, 3)).astype(np.float32)
+    rgb = np.full((600, 3), 120, dtype=np.uint8)
+    previews = []
+
+    sc = train_3dgs_scene(
+        views=views,
+        xyz=xyz,
+        rgb=rgb,
+        poses=poses,
+        steps=450,
+        warmup_steps=120,
+        mid_res_steps=120,
+        cap_max=2000,
+        refine_start_iter=150,
+        refine_stop_iter=350,
+        refine_every=100,
+        reset_every=500,
+        scene_type="outdoor",
+        preview_cb=lambda im: previews.append(im.copy()),
+    )
+    assert sc.val_psnr_db is not None and np.isfinite(sc.val_psnr_db)
+    assert sc.val_psnr_db > 15.0
+    assert len(previews) >= 1 and previews[-1].ndim == 3 and previews[-1].dtype == np.uint8
+    sc.release()
+
+
+
+

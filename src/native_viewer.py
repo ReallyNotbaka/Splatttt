@@ -82,6 +82,7 @@ from src.m3_ui import (
 
 
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
+SCENE_EXTS = {".ply", ".glb", ".gltf", ".obj", ".npz"}
 
 _GPU_INFO_CACHE: Optional[tuple[str, str]] = None
 
@@ -183,6 +184,9 @@ class SplatOrbitCamera:
         self.yaw: float = 0.0
         self.pitch: float = 0.25
         self.fov_deg: float = 50.0
+        self._floor_y: Optional[float] = None
+        self._floor_margin: float = 0.05
+        self._scene_extent: float = 1.0
 
     def get_c2w(self) -> np.ndarray:
         cp = float(np.cos(self.pitch))
@@ -300,9 +304,12 @@ class SplatOrbitCamera:
                     pts = pts[near_mask]
 
         if pts is not None and len(pts) >= 10:
+            p10 = np.percentile(pts, 10, axis=0)
             p20 = np.percentile(pts, 20, axis=0)
             p80 = np.percentile(pts, 80, axis=0)
             center = 0.5 * (p20 + p80)
+            # Bias vertical aim upward so tall center subjects are not cropped by dense floor points
+            center[1] = 0.5 * (p10[1] + p80[1])
             span = float(np.linalg.norm(p80 - p20))
             radius = max(0.8, span * 0.5)
         elif len(cam_centers) > 0:
@@ -313,6 +320,18 @@ class SplatOrbitCamera:
             center = np.zeros(3, dtype=np.float32)
             span = 3.0
             radius = 1.5
+
+        self._scene_extent = max(0.5, float(radius))
+        self._floor_y = None
+        if len(cam_centers) >= 4 and pts is not None and len(pts) >= 32:
+            ring_pts = pts[
+                np.linalg.norm(pts[:, [0, 2]] - cam_center[[0, 2]], axis=1) <= max(0.8, cam_rad_med * 1.6)
+            ]
+            if len(ring_pts) >= 32:
+                cand_floor = float(np.percentile(ring_pts[:, 1], 88))
+                if cand_floor > float(cam_center[1]) + 0.05 * cam_rad_med:
+                    self._floor_y = cand_floor
+                    self._floor_margin = max(0.04, 0.08 * cam_rad_med)
 
         if len(valid_poses) > 0:
             fwd0 = np.asarray(valid_poses[0].r_wc, dtype=np.float32) @ np.array(
@@ -330,8 +349,8 @@ class SplatOrbitCamera:
 
         if len(cam_centers) >= 8 and ang_cov > np.deg2rad(210.0):
             # Inward 360 orbit: stay inside/along the camera ring so outer bushes/walls never block overview
-            dist_use = max(0.55, min(cam_rad_med * 1.18, max(cam_rad_med * 0.95, span * 0.72)))
-            elev = 0.28
+            dist_use = max(0.58, min(cam_rad_med * 1.30, max(cam_rad_med * 1.02, span * 0.76)))
+            elev = 0.24
             overview_pos = (
                 center
                 - horiz_fwd * (dist_use * float(np.cos(elev)))
@@ -359,9 +378,32 @@ class SplatOrbitCamera:
             )
         self._set_eye_target(overview_pos, center)
 
+    def _clamp_above_floor(self, adjust_target: bool = False) -> None:
+        if self._floor_y is None:
+            return
+        max_eye_y = float(self._floor_y - self._floor_margin)
+        dist = max(0.08, float(self.distance))
+        if adjust_target:
+            cur_eye_y = float(self.target[1]) - dist * float(np.sin(self.pitch))
+            if cur_eye_y > max_eye_y:
+                self.target[1] = np.float32(float(self.target[1]) - (cur_eye_y - max_eye_y))
+            return
+        max_targ_y = max_eye_y + dist * 0.90
+        if float(self.target[1]) > max_targ_y:
+            self.target[1] = np.float32(max_targ_y)
+        cp_sin = (float(self.target[1]) - max_eye_y) / dist
+        if cp_sin >= 0.985:
+            self.pitch = float(max(self.pitch, 1.40))
+            self.target[1] = np.float32(max_eye_y + float(np.sin(self.pitch)) * dist)
+        else:
+            min_pitch = float(np.arcsin(np.clip(cp_sin, -0.985, 0.985)))
+            if self.pitch < min_pitch:
+                self.pitch = min_pitch
+
     def orbit(self, dx_px: float, dy_px: float) -> None:
         self.yaw += float(dx_px) * 0.006
         self.pitch = float(np.clip(self.pitch + float(dy_px) * 0.006, -1.48, 1.48))
+        self._clamp_above_floor(adjust_target=False)
 
     def pan(self, dx_px: float, dy_px: float) -> None:
         c2w = self.get_c2w()
@@ -369,25 +411,28 @@ class SplatOrbitCamera:
         down = c2w[:3, 1]
         scale = max(0.05, float(self.distance)) * 0.0018
         self.target = self.target - right * (float(dx_px) * scale) - down * (float(dy_px) * scale)
+        self._clamp_above_floor(adjust_target=True)
 
     def zoom(self, delta_steps: float) -> None:
         self.distance = max(0.08, float(self.distance) * (0.88 ** float(delta_steps)))
+        self._clamp_above_floor(adjust_target=False)
 
-    def fly(self, fwd_amt: float, right_amt: float, up_amt: float) -> None:
+    def fly(self, fwd_amt: float, right_amt: float, up_amt: float, speed_mult: float = 1.0) -> None:
         c2w = self.get_c2w()
         forward = c2w[:3, 2]
         right = c2w[:3, 0]
-        step_scale = max(0.08, float(self.distance) * 0.08)
+        step_scale = max(0.06, float(self._scene_extent) * 0.045) * float(speed_mult)
         delta = (
             forward * (float(fwd_amt) * step_scale)
             + right * (float(right_amt) * step_scale)
             + _COLMAP_WORLD_UP * (float(up_amt) * step_scale)
         )
         self.target = self.target + delta
+        self._clamp_above_floor(adjust_target=True)
 
 
 class SplatViewportWidget(QWidget):
-    """Live CUDA-rendered 3DGS viewport with 0.5x interactive drag + 120ms 1.0x snap."""
+    """Live CUDA-rendered 3DGS viewport with adaptive drag scaling, RGBA blit, and held-key flight."""
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -398,17 +443,42 @@ class SplatViewportWidget(QWidget):
         self._qimage: Optional[QImage] = None
         self._img_buf: Optional[np.ndarray] = None
         self._last_render_ms: float = 0.0
+        self._interactive_scale: float = 0.52
+        self._preview_hud: Optional[str] = None
         self._last_drag_pos = None
         self._drag_mode: Optional[str] = None
         self._bg_color = QColor("#10141c")
+        self._pressed_keys: set[int] = set()
+        self._key_mods = Qt.KeyboardModifier.NoModifier
 
         self._debounce_timer = QTimer(self)
         self._debounce_timer.setSingleShot(True)
         self._debounce_timer.setInterval(120)
         self._debounce_timer.timeout.connect(self.render_full)
 
+        self._key_fly_timer = QTimer(self)
+        self._key_fly_timer.setInterval(33)
+        self._key_fly_timer.timeout.connect(self._tick_key_fly)
+
     def set_background_hex(self, hex_color: str) -> None:
         self._bg_color = QColor(hex_color)
+        self.update()
+
+    def set_preview_image(self, rgb: np.ndarray, hud_text: str = "Live 3DGS preview...") -> None:
+        """Display a progressive RGB uint8 frame inside the 3DGS viewport while training runs."""
+        h, w = rgb.shape[:2]
+        rgba = np.empty((h, w, 4), dtype=np.uint8)
+        rgba[..., :3] = rgb
+        rgba[..., 3] = 255
+        self._img_buf = np.ascontiguousarray(rgba, dtype=np.uint8)
+        self._qimage = QImage(
+            self._img_buf.data,
+            w,
+            h,
+            w * 4,
+            QImage.Format.Format_RGBA8888,
+        )
+        self._preview_hud = hud_text
         self.update()
 
     def set_scene(
@@ -418,6 +488,7 @@ class SplatViewportWidget(QWidget):
         intrinsics: Optional[np.ndarray] = None,
         frame_size: Optional[tuple[int, int]] = None,
     ) -> None:
+        self._preview_hud = None
         self._splat_scene = splat_scene
         means_np = None
         if splat_scene is not None and hasattr(splat_scene, "means"):
@@ -430,6 +501,9 @@ class SplatViewportWidget(QWidget):
 
     def clear_scene(self) -> None:
         self._debounce_timer.stop()
+        self._key_fly_timer.stop()
+        self._pressed_keys.clear()
+        self._preview_hud = None
         self._splat_scene = None
         self._qimage = None
         self._img_buf = None
@@ -439,7 +513,7 @@ class SplatViewportWidget(QWidget):
         self._render(scale=1.0)
 
     def render_interactive(self) -> None:
-        self._render(scale=0.5)
+        self._render(scale=self._interactive_scale)
         self._debounce_timer.start()
 
     def _render(self, scale: float = 1.0) -> None:
@@ -462,16 +536,22 @@ class SplatViewportWidget(QWidget):
             t0 = time.perf_counter()
             c2w = self.camera.get_c2w()
             k_mat = self.camera.get_intrinsics(rw, rh)
-            rgb = render_view(self._splat_scene, c2w=c2w, K=k_mat, width=rw, height=rh)
+            rgba = render_view(self._splat_scene, c2w=c2w, K=k_mat, width=rw, height=rh, rgba=True)
             self._last_render_ms = (time.perf_counter() - t0) * 1000.0
-            self._img_buf = np.ascontiguousarray(rgb, dtype=np.uint8)
+            if scale < 0.99:
+                if self._last_render_ms > 38.0:
+                    self._interactive_scale = max(0.35, self._interactive_scale * 0.88)
+                elif self._last_render_ms < 16.0:
+                    self._interactive_scale = min(0.75, self._interactive_scale * 1.06)
+            self._img_buf = np.ascontiguousarray(rgba, dtype=np.uint8)
             self._qimage = QImage(
                 self._img_buf.data,
                 rw,
                 rh,
-                rw * 3,
-                QImage.Format.Format_RGB888,
+                rw * 4,
+                QImage.Format.Format_RGBA8888,
             )
+            self._preview_hud = None
             self.update()
         except Exception as exc:
             _logger.warning("SplatViewportWidget render failed: %s", exc)
@@ -482,15 +562,40 @@ class SplatViewportWidget(QWidget):
         if self._qimage is not None and not self._qimage.isNull():
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
             painter.drawImage(self.rect(), self._qimage)
-            if self._splat_scene is not None:
+            hud: Optional[str] = self._preview_hud
+            if hud is None and self._splat_scene is not None:
                 n_gs = int(getattr(self._splat_scene, "final_splats", 0))
                 hud = f"3DGS CUDA  |  {n_gs:,} splats  |  {self._last_render_ms:.1f} ms"
+            if hud:
                 hud_w = QFontMetrics(painter.font()).horizontalAdvance(hud) + 20
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.setBrush(QColor(0, 0, 0, 145))
                 painter.drawRoundedRect(10, 10, hud_w, 26, 6, 6)
                 painter.setPen(QColor(235, 240, 248))
                 painter.drawText(20, 27, hud)
+
+    def _tick_key_fly(self) -> None:
+        if self._splat_scene is None or not self._pressed_keys:
+            self._key_fly_timer.stop()
+            return
+        fwd = float(Qt.Key.Key_W in self._pressed_keys) - float(Qt.Key.Key_S in self._pressed_keys)
+        right = float(Qt.Key.Key_D in self._pressed_keys) - float(Qt.Key.Key_A in self._pressed_keys)
+        up = float(Qt.Key.Key_E in self._pressed_keys) - float(Qt.Key.Key_Q in self._pressed_keys)
+        if fwd == 0.0 and right == 0.0 and up == 0.0:
+            self._key_fly_timer.stop()
+            return
+        mult = 0.45
+        if self._key_mods & Qt.KeyboardModifier.ShiftModifier:
+            mult *= 2.5
+        if self._key_mods & Qt.KeyboardModifier.ControlModifier:
+            mult *= 0.35
+        self.camera.fly(fwd, right, up, speed_mult=mult)
+        self.render_interactive()
+
+    def focusOutEvent(self, event) -> None:
+        self._pressed_keys.clear()
+        self._key_fly_timer.stop()
+        super().focusOutEvent(event)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -543,30 +648,36 @@ class SplatViewportWidget(QWidget):
             super().keyPressEvent(event)
             return
         key = event.key()
-        handled = True
-        if key == Qt.Key.Key_W:
-            self.camera.fly(1.0, 0.0, 0.0)
-        elif key == Qt.Key.Key_S:
-            self.camera.fly(-1.0, 0.0, 0.0)
-        elif key == Qt.Key.Key_A:
-            self.camera.fly(0.0, -1.0, 0.0)
-        elif key == Qt.Key.Key_D:
-            self.camera.fly(0.0, 1.0, 0.0)
-        elif key == Qt.Key.Key_E:
-            self.camera.fly(0.0, 0.0, 1.0)
-        elif key == Qt.Key.Key_Q:
-            self.camera.fly(0.0, 0.0, -1.0)
-        else:
-            handled = False
-        if handled:
-            self.render_interactive()
+        fly_keys = {Qt.Key.Key_W, Qt.Key.Key_S, Qt.Key.Key_A, Qt.Key.Key_D, Qt.Key.Key_E, Qt.Key.Key_Q}
+        if key in fly_keys:
+            self._key_mods = event.modifiers()
+            if not event.isAutoRepeat():
+                self._pressed_keys.add(key)
+                self._tick_key_fly()
+                if not self._key_fly_timer.isActive():
+                    self._key_fly_timer.start()
             event.accept()
-        else:
-            super().keyPressEvent(event)
+            return
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event: QKeyEvent) -> None:
+        if self._splat_scene is None:
+            super().keyReleaseEvent(event)
+            return
+        if not event.isAutoRepeat() and event.key() in self._pressed_keys:
+            self._pressed_keys.discard(event.key())
+            self._key_mods = event.modifiers()
+            if not self._pressed_keys:
+                self._key_fly_timer.stop()
+                self._debounce_timer.start()
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
 
 
 class ReconstructWorker(QThread):
     progress = Signal(float, str)
+    preview_ready = Signal(object)
     finished_ok = Signal(object, float, list)
     failed = Signal(str)
 
@@ -618,6 +729,7 @@ class ReconstructWorker(QThread):
                 config=self.config,
                 progress_cb=lambda frac, msg: self.progress.emit(frac, msg),
                 cancel_cb=lambda: self._cancelled,
+                preview_cb=lambda im: self.preview_ready.emit(im),
             )
             exported_paths: List[Path] = []
             if self._cancelled:
@@ -691,6 +803,7 @@ class Native3DWindow(QMainWindow):
         self._build_start_t = 0.0
         self._last_logged_stage = ""
         self._last_preview_rgb: Optional[np.ndarray] = None
+        self._last_fly_kf: int = -1
         self._scene_frustum_scale = 0.16
         self._gsplat_avail: bool = _safe_is_gsplat_available()
         self._active_build_mode: str = "tsdf"
@@ -885,7 +998,8 @@ class Native3DWindow(QMainWindow):
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
-        self.open_btn = M3Button("Open video", variant="tonal", icon_name="folder", height=36)
+        self.open_btn = M3Button("Open video / 3D", variant="tonal", icon_name="folder", height=36)
+        self.open_btn.setToolTip("Open a video (.mp4/.mov/...) or saved 3D scene (.ply/.glb/.obj/.npz)")
         self.open_btn.clicked.connect(self.pick_video_file)
         btn_row.addWidget(self.open_btn, stretch=1)
 
@@ -1078,6 +1192,32 @@ class Native3DWindow(QMainWindow):
         )
         cp_layout.addWidget(self.demo_sec_spin)
 
+        self.start_sec_spin = M3NumericControl(
+            "Trim start",
+            min_val=0.0,
+            max_val=3600.0,
+            init_val=float(self._initial_start_sec),
+            step=0.5,
+            decimals=1,
+            suffix=" s",
+            slider_max=120.0,
+        )
+        self.start_sec_spin.valueChanged.connect(self._on_trim_changed)
+        cp_layout.addWidget(self.start_sec_spin)
+
+        self.end_sec_spin = M3NumericControl(
+            "Trim end (0=end)",
+            min_val=0.0,
+            max_val=3600.0,
+            init_val=float(self._initial_end_sec),
+            step=0.5,
+            decimals=1,
+            suffix=" s",
+            slider_max=120.0,
+        )
+        self.end_sec_spin.valueChanged.connect(self._on_trim_changed)
+        cp_layout.addWidget(self.end_sec_spin)
+
         lbl_dev = QLabel("Compute device:")
         lbl_dev.setObjectName("m3Muted")
         cp_layout.addWidget(lbl_dev)
@@ -1227,6 +1367,11 @@ class Native3DWindow(QMainWindow):
         self.exp_ply_btn.clicked.connect(lambda: self.export_current(".ply", False))
         man_row.addWidget(self.exp_ply_btn, stretch=1)
 
+        self.exp_splat_btn = M3Button("SPLAT", variant="tonal", icon_name="export", height=34)
+        self.exp_splat_btn.setToolTip("Compact 32-byte/splat web format (3DGS mode)")
+        self.exp_splat_btn.clicked.connect(lambda: self.export_current(".splat", False))
+        man_row.addWidget(self.exp_splat_btn, stretch=1)
+
         self.exp_glb_btn = M3Button("GLB", variant="tonal", icon_name="export", height=34)
         self.exp_glb_btn.clicked.connect(lambda: self.export_current(".glb", True))
         man_row.addWidget(self.exp_glb_btn, stretch=1)
@@ -1236,6 +1381,17 @@ class Native3DWindow(QMainWindow):
         man_row.addWidget(self.exp_obj_btn, stretch=1)
 
         cexp_layout.addLayout(man_row)
+
+        media_row = QHBoxLayout()
+        media_row.setSpacing(6)
+        self.snap_png_btn = M3Button("Snapshot PNG", variant="outlined", icon_name="camera", height=34)
+        self.snap_png_btn.clicked.connect(self.export_snapshot_png)
+        media_row.addWidget(self.snap_png_btn, stretch=1)
+
+        self.turntable_btn = M3Button("Turntable MP4", variant="outlined", icon_name="play", height=34)
+        self.turntable_btn.clicked.connect(self.export_turntable_mp4)
+        media_row.addWidget(self.turntable_btn, stretch=1)
+        cexp_layout.addLayout(media_row)
 
         pe_layout.addWidget(card_exp)
         pe_layout.addStretch(1)
@@ -1569,9 +1725,24 @@ class Native3DWindow(QMainWindow):
         finally:
             self._syncing_preset = False
 
+    def _on_trim_changed(self, *_args):
+        if hasattr(self, "start_sec_spin"):
+            self._initial_start_sec = max(0.0, float(self.start_sec_spin.value()))
+        if hasattr(self, "end_sec_spin"):
+            self._initial_end_sec = max(0.0, float(self.end_sec_spin.value()))
+
     def _on_recon_mode_changed(self, *_args):
         is_3dgs = str(self.recon_mode_combo.currentData() or "tsdf") == "3dgs"
         self.depth_model_combo.setEnabled(not is_3dgs)
+        for ctrl in ("max_dim_spin", "point_stride_spin", "mesh_stride_spin", "edge_thresh_spin"):
+            w = getattr(self, ctrl, None)
+            if w is not None:
+                w.setEnabled(not is_3dgs)
+                w.setToolTip(
+                    "Controlled automatically by 3DGS preset (TSDF only)"
+                    if is_3dgs
+                    else ""
+                )
         if not self._gsplat_avail and len(self.recon_mode_combo._buttons) > 1:
             self.recon_mode_combo._buttons[1].setEnabled(False)
         self._update_active_model_lbl()
@@ -1681,7 +1852,7 @@ class Native3DWindow(QMainWindow):
         if event.mimeData().hasUrls():
             for url in event.mimeData().urls():
                 p = Path(url.toLocalFile())
-                if p.suffix.lower() in VIDEO_EXTS:
+                if p.suffix.lower() in VIDEO_EXTS or p.suffix.lower() in SCENE_EXTS:
                     event.acceptProposedAction()
                     if hasattr(self, "preview_widget") and self.preview_widget is not None:
                         self.preview_widget.set_drag_hover(True)
@@ -1698,20 +1869,141 @@ class Native3DWindow(QMainWindow):
             self.preview_widget.set_drag_hover(False)
         for url in event.mimeData().urls():
             p = Path(url.toLocalFile())
-            if p.is_file() and p.suffix.lower() in VIDEO_EXTS:
-                self.set_video_path(p)
+            if p.is_file() and (p.suffix.lower() in VIDEO_EXTS or p.suffix.lower() in SCENE_EXTS):
+                self.open_input_path(p)
                 event.acceptProposedAction()
                 return
 
     def pick_video_file(self):
-        dialog = QFileDialog(self, "Select Video File")
+        dialog = QFileDialog(self, "Open Video or Saved 3D Scene")
         dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
         dialog.setOption(QFileDialog.Option.DontUseNativeDialog, False)
-        dialog.setNameFilter("Video Files (*.mp4 *.mov *.avi *.mkv *.webm *.m4v);;All Files (*.*)")
+        dialog.setNameFilter(
+            "Video & 3D Files (*.mp4 *.mov *.avi *.mkv *.webm *.m4v *.ply *.glb *.gltf *.obj *.npz);;"
+            "Video Files (*.mp4 *.mov *.avi *.mkv *.webm *.m4v);;"
+            "3D Scenes (*.ply *.glb *.gltf *.obj *.npz);;All Files (*.*)"
+        )
         if dialog.exec():
             files = dialog.selectedFiles()
             if files:
-                self.set_video_path(Path(files[0]))
+                self.open_input_path(Path(files[0]))
+
+    def open_input_path(self, path: Path) -> None:
+        ext = path.suffix.lower()
+        if ext in VIDEO_EXTS:
+            self.set_video_path(path)
+        elif ext in SCENE_EXTS:
+            self.load_saved_scene_file(path)
+
+    def load_saved_scene_file(self, path: Path) -> None:
+        """Open a saved .ply (3DGS or mesh/cloud), .glb/.gltf/.obj mesh, or .npz cache directly."""
+        from src.pipeline import ReconstructionResult, load_result_cache
+        from src.scene_builder import Scene3D
+        from src.video_ingest import VideoData
+
+        ext = path.suffix.lower()
+        try:
+            if ext == ".npz":
+                res = load_result_cache(path)
+                if res.video_data.path.exists():
+                    self.set_video_path(res.video_data.path)
+                self.load_result(res)
+                self.stage_pill.setText("Loaded cache")
+                self._log_milestone(f"Loaded scene cache '{path.name}'")
+                return
+
+            if ext == ".ply" and _safe_is_gsplat_available():
+                try:
+                    from src.gsplat_engine import load_splats_ply
+
+                    splat_sc, loaded_poses, loaded_k, loaded_fsz = load_splats_ply(path)
+                    fsz = loaded_fsz or (1280, 720)
+                    k_mat = (
+                        loaded_k
+                        if loaded_k is not None
+                        else np.array([[900.0, 0.0, fsz[0] * 0.5], [0.0, 900.0, fsz[1] * 0.5], [0.0, 0.0, 1.0]], dtype=np.float32)
+                    )
+                    xyz_np = splat_sc.means.detach().cpu().numpy().astype(np.float32)
+                    scene = Scene3D(
+                        points=xyz_np,
+                        colors=np.full((len(xyz_np), 3), 180, dtype=np.uint8),
+                        normals=np.zeros_like(xyz_np, dtype=np.float32),
+                        mesh_vertices=np.zeros((0, 3), dtype=np.float32),
+                        mesh_faces=np.zeros((0, 3), dtype=np.int32),
+                        mesh_colors=np.zeros((0, 3), dtype=np.uint8),
+                        poses=loaded_poses or [],
+                        intrinsics=k_mat,
+                        frame_size=fsz,
+                    )
+                    vd = VideoData(path=path, fps=30.0, total_frames=len(loaded_poses or []), duration=0.0, orig_size=fsz, frames=[])
+                    res = ReconstructionResult(video_data=vd, scene=scene, splat_scene=splat_sc, splat_ply_path=path)
+                    self.load_result(res, exported=[path])
+                    self.stage_pill.setText("Loaded 3DGS")
+                    self._log_milestone(f"Loaded 3DGS PLY '{path.name}' ({splat_sc.final_splats:,} splats)")
+                    return
+                except ValueError:
+                    pass
+
+            import trimesh
+
+            loaded = trimesh.load(str(path), process=False)
+            if isinstance(loaded, trimesh.Scene):
+                geoms = [g for g in loaded.geometry.values() if hasattr(g, "vertices") and len(g.vertices) > 0]
+                if not geoms:
+                    raise ValueError(f"No geometry in {path.name}")
+                loaded = trimesh.util.concatenate(geoms) if len(geoms) > 1 else geoms[0]
+
+            if isinstance(loaded, trimesh.Trimesh) and len(loaded.faces) > 0:
+                verts = np.asarray(loaded.vertices, dtype=np.float32)
+                faces = np.asarray(loaded.faces, dtype=np.int32)
+                m_uvs = None
+                m_tex = None
+                vcols = np.full((len(verts), 3), 185, dtype=np.uint8)
+                vis = getattr(loaded, "visual", None)
+                if getattr(vis, "kind", None) == "texture" and getattr(vis, "uv", None) is not None:
+                    mat = getattr(vis, "material", None)
+                    img = getattr(mat, "baseColorTexture", None) or getattr(mat, "image", None)
+                    if img is not None:
+                        m_tex = np.asarray(img.convert("RGB"), dtype=np.uint8)
+                        m_uvs = np.asarray(vis.uv, dtype=np.float32)
+                elif getattr(vis, "vertex_colors", None) is not None and len(vis.vertex_colors) == len(verts):
+                    vcols = np.asarray(vis.vertex_colors[:, :3], dtype=np.uint8)
+                scene = Scene3D(
+                    points=verts,
+                    colors=vcols,
+                    normals=np.asarray(loaded.vertex_normals, dtype=np.float32) if len(loaded.vertex_normals) == len(verts) else np.zeros_like(verts),
+                    mesh_vertices=verts,
+                    mesh_faces=faces,
+                    mesh_colors=vcols,
+                    poses=[],
+                    intrinsics=np.eye(3, dtype=np.float32),
+                    frame_size=(1280, 720),
+                    mesh_uvs=m_uvs,
+                    mesh_texture=m_tex,
+                )
+            else:
+                pts = np.asarray(getattr(loaded, "vertices", loaded), dtype=np.float32)
+                cols = np.full((len(pts), 3), 185, dtype=np.uint8)
+                if hasattr(loaded, "colors") and loaded.colors is not None and len(loaded.colors) == len(pts):
+                    cols = np.asarray(loaded.colors[:, :3], dtype=np.uint8)
+                scene = Scene3D(
+                    points=pts,
+                    colors=cols,
+                    normals=np.zeros_like(pts),
+                    mesh_vertices=np.zeros((0, 3), dtype=np.float32),
+                    mesh_faces=np.zeros((0, 3), dtype=np.int32),
+                    mesh_colors=np.zeros((0, 3), dtype=np.uint8),
+                    poses=[],
+                    intrinsics=np.eye(3, dtype=np.float32),
+                    frame_size=(1280, 720),
+                )
+            vd = VideoData(path=path, fps=30.0, total_frames=0, duration=0.0, orig_size=(1280, 720), frames=[])
+            res = ReconstructionResult(video_data=vd, scene=scene)
+            self.load_result(res, exported=[path])
+            self.stage_pill.setText("Loaded 3D")
+            self._log_milestone(f"Loaded saved 3D scene '{path.name}'")
+        except Exception as exc:
+            QMessageBox.critical(self, "Load Failed", f"Could not load {path.name}: {exc}")
 
     def pick_output_folder(self):
         folder = QFileDialog.getExistingDirectory(
@@ -1834,6 +2126,14 @@ class Native3DWindow(QMainWindow):
             self.auto_obj_chk.isChecked(),
         )
 
+        if preset.recon_mode == "3dgs":
+            self.plotter.clear_actors()
+            self._set_viewport_mode(True)
+            self.splat_viewport.set_preview_image(
+                self._last_preview_rgb if self._last_preview_rgb is not None else np.zeros((270, 480, 3), dtype=np.uint8),
+                hud_text="Preparing 3DGS views...",
+            )
+
         self.worker = ReconstructWorker(
             self._pipeline,
             self.current_video,
@@ -1844,9 +2144,16 @@ class Native3DWindow(QMainWindow):
             end_sec=self._initial_end_sec,
         )
         self.worker.progress.connect(self._on_worker_progress)
+        self.worker.preview_ready.connect(self._on_worker_preview)
         self.worker.finished_ok.connect(self._on_worker_done)
         self.worker.failed.connect(self._on_worker_failed)
         self.worker.start()
+
+    def _on_worker_preview(self, rgb: Any):
+        if isinstance(rgb, np.ndarray) and rgb.ndim == 3 and hasattr(self, "splat_viewport"):
+            if self.viewport_stack.currentIndex() != 1:
+                self.viewport_stack.setCurrentIndex(1)
+            self.splat_viewport.set_preview_image(rgb, hud_text=f"Live 3DGS preview  |  {self.status_lbl.text()}")
 
     def _on_worker_progress(self, frac: float, msg: str):
         self.prog_bar.setValue(int(round(frac * 100)))
@@ -1915,9 +2222,14 @@ class Native3DWindow(QMainWindow):
         exp_names = ", ".join(p.name for p in exported) if exported else "no auto-exports"
         splat_sc = getattr(result, "splat_scene", None)
         if splat_sc is not None:
+            val_msg = (
+                f", val {splat_sc.val_psnr_db:.2f} dB"
+                if getattr(splat_sc, "val_psnr_db", None) is not None
+                else ""
+            )
             self._log_milestone(
                 f"Completed 3DGS in {elapsed:.1f}s -> {splat_sc.final_splats:,} splats, "
-                f"train PSNR {splat_sc.train_psnr_db:.2f} dB, peak VRAM {splat_sc.peak_vram_gb:.2f} GB ({exp_names})"
+                f"train PSNR {splat_sc.train_psnr_db:.2f} dB{val_msg}, peak VRAM {splat_sc.peak_vram_gb:.2f} GB ({exp_names})"
             )
         else:
             self._log_milestone(
@@ -1943,17 +2255,21 @@ class Native3DWindow(QMainWindow):
             self.status_lbl.setText(f"Failed: {err}")
             self._log_milestone(f"ERROR: {err}")
             QMessageBox.critical(self, "Reconstruction Failed", err)
-        if (
-            self.current_result is not None
-            and getattr(self.current_result, "splat_scene", None) is not None
-            and self.viewport_stack.currentIndex() == 1
-        ):
+        prev_splat = getattr(self.current_result, "splat_scene", None) if self.current_result is not None else None
+        if prev_splat is not None and _safe_is_gsplat_available():
+            self._set_viewport_mode(True)
             self.splat_viewport.set_scene(
-                self.current_result.splat_scene,
+                prev_splat,
                 self.current_result.scene.poses,
                 intrinsics=self.current_result.scene.intrinsics,
                 frame_size=self.current_result.scene.frame_size,
             )
+        elif self.current_result is not None:
+            self._set_viewport_mode(False)
+            self.refresh_3d_actors()
+        else:
+            self.splat_viewport.clear_scene()
+            self._set_viewport_mode(False)
 
     def _release_active_splat_scene(self):
         if hasattr(self, "splat_viewport"):
@@ -1979,6 +2295,8 @@ class Native3DWindow(QMainWindow):
             self.exp_obj_btn,
         ):
             w.setEnabled(tsdf_enabled)
+        if hasattr(self, "exp_splat_btn"):
+            self.exp_splat_btn.setEnabled(is_3dgs)
 
     def load_result(
         self,
@@ -2379,6 +2697,7 @@ class Native3DWindow(QMainWindow):
             if self.viewport_stack.currentIndex() == 1:
                 self.splat_viewport.render_full()
         else:
+            self._last_fly_kf = -1
             self.fly_t = 0.0
             self.fly_btn.setText("Stop Fly")
             self.fly_btn.set_icon_name("stop")
@@ -2413,10 +2732,12 @@ class Native3DWindow(QMainWindow):
         up = (1.0 - alpha) * u0 + alpha * u1
         up_norm = up / max(1e-6, float(np.linalg.norm(up)))
 
-        self.kf_slider.blockSignals(True)
-        self.kf_slider.setValue(i0)
-        self.kf_slider.blockSignals(False)
-        self.on_keyframe_scrub(i0, render=False)
+        if i0 != self._last_fly_kf:
+            self._last_fly_kf = i0
+            self.kf_slider.blockSignals(True)
+            self.kf_slider.setValue(i0)
+            self.kf_slider.blockSignals(False)
+            self.on_keyframe_scrub(i0, render=False)
 
         if self.viewport_stack.currentIndex() == 1 and getattr(self.current_result, "splat_scene", None) is not None:
             look_d = self._splat_look_dist()
@@ -2451,16 +2772,161 @@ class Native3DWindow(QMainWindow):
         )
         if path_str:
             splat_sc = getattr(self.current_result, "splat_scene", None)
-            if splat_sc is not None and ext.lower() == ".ply":
+            if splat_sc is not None and ext.lower() == ".splat":
+                from src.gsplat_engine import export_splats_dot_splat
+
+                out = export_splats_dot_splat(splat_sc, Path(path_str))
+            elif splat_sc is not None and ext.lower() == ".ply":
                 from src.gsplat_engine import export_splats_ply
 
-                out = export_splats_ply(splat_sc, Path(path_str))
+                out = export_splats_ply(
+                    splat_sc,
+                    Path(path_str),
+                    poses=self.current_result.scene.poses,
+                    intrinsics=self.current_result.scene.intrinsics,
+                    frame_size=self.current_result.scene.frame_size,
+                )
             else:
                 from src.scene_builder import export_scene
 
                 out = export_scene(self.current_result.scene, Path(path_str), export_mesh=as_mesh)
             self.status_lbl.setText(f"Saved {out.name}")
             self._log_milestone(f"Manual export -> {out}")
+
+    def export_snapshot_png(self, target_path: Optional[Path] = None) -> Optional[Path]:
+        """Save the current 3D viewport view as a full-resolution PNG image."""
+        if self.current_result is None:
+            if target_path is None:
+                QMessageBox.information(self, "Nothing to Snapshot", "Build or load a 3D scene first.")
+            return None
+        out_path = Path(target_path) if target_path is not None else None
+        if out_path is None:
+            out_dir = Path(self.out_dir_edit.text().strip() or "outputs")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            path_str, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save Viewport Snapshot",
+                str(out_dir / "snapshot.png"),
+                "PNG Image (*.png)",
+            )
+            if not path_str:
+                return None
+            out_path = Path(path_str)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        splat_sc = getattr(self.current_result, "splat_scene", None)
+        if self.viewport_stack.currentIndex() == 1 and splat_sc is not None and _safe_is_gsplat_available():
+            from src.gsplat_engine import render_view
+
+            if self.splat_viewport.isVisible() and self.splat_viewport.width() >= 200 and self.splat_viewport.height() >= 150:
+                aspect = float(self.splat_viewport.width()) / float(self.splat_viewport.height())
+            else:
+                fsz = getattr(self.current_result.scene, "frame_size", (1280, 720))
+                aspect = float(max(1, int(fsz[0]))) / float(max(1, int(fsz[1])))
+            rw = 1600
+            rh = max(128, int(round(rw / max(0.25, aspect))) // 2 * 2)
+            rgb = render_view(
+                splat_sc,
+                c2w=self.splat_viewport.camera.get_c2w(),
+                K=self.splat_viewport.camera.get_intrinsics(rw, rh),
+                width=rw,
+                height=rh,
+            )
+            cv2.imwrite(str(out_path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        else:
+            self.plotter.screenshot(filename=str(out_path))
+
+        self.status_lbl.setText(f"Saved snapshot {out_path.name}")
+        self._log_milestone(f"Saved PNG snapshot -> {out_path}")
+        return out_path
+
+    def export_turntable_mp4(
+        self,
+        target_path: Optional[Path] = None,
+        n_frames: int = 90,
+        fps: int = 30,
+    ) -> Optional[Path]:
+        """Render a smooth 360-degree orbit video around the current camera target."""
+        if self.current_result is None:
+            if target_path is None:
+                QMessageBox.information(self, "Nothing to Export", "Build or load a 3D scene first.")
+            return None
+        out_path = Path(target_path) if target_path is not None else None
+        if out_path is None:
+            out_dir = Path(self.out_dir_edit.text().strip() or "outputs")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            path_str, _ = QFileDialog.getSaveFileName(
+                self,
+                "Export 360 Turntable Video",
+                str(out_dir / "turntable.mp4"),
+                "MP4 Video (*.mp4)",
+            )
+            if not path_str:
+                return None
+            out_path = Path(path_str)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        n_frames = max(12, int(n_frames))
+        fps = max(10, int(fps))
+        splat_sc = getattr(self.current_result, "splat_scene", None)
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+        if self.viewport_stack.currentIndex() == 1 and splat_sc is not None and _safe_is_gsplat_available():
+            from src.gsplat_engine import render_view
+
+            rw, rh = 1280, 720
+            cam = self.splat_viewport.camera
+            orig_yaw = float(cam.yaw)
+            orig_pitch = float(cam.pitch)
+            writer = cv2.VideoWriter(str(out_path), fourcc, float(fps), (rw, rh))
+            try:
+                for k in range(n_frames):
+                    cam.yaw = orig_yaw + (2.0 * np.pi * k / float(n_frames))
+                    cam._clamp_above_floor(adjust_target=False)
+                    k_mat = cam.get_intrinsics(rw, rh)
+                    rgb = render_view(splat_sc, c2w=cam.get_c2w(), K=k_mat, width=rw, height=rh)
+                    writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+                    if k % 15 == 0:
+                        self.status_lbl.setText(f"Rendering turntable... ({k + 1}/{n_frames})")
+                        QApplication.processEvents()
+            finally:
+                cam.yaw = orig_yaw
+                cam.pitch = orig_pitch
+                writer.release()
+            self.splat_viewport.render_full()
+        else:
+            pos0 = np.array(self.plotter.camera.position, dtype=np.float64)
+            foc0 = np.array(self.plotter.camera.focal_point, dtype=np.float64)
+            up0 = np.array(self.plotter.camera.up, dtype=np.float64)
+            rel0 = pos0 - foc0
+            first_img = self.plotter.screenshot(return_img=True)
+            rh, rw = int(first_img.shape[0]), int(first_img.shape[1])
+            writer = cv2.VideoWriter(str(out_path), fourcc, float(fps), (rw, rh))
+            try:
+                for k in range(n_frames):
+                    ang = 2.0 * np.pi * k / float(n_frames)
+                    ca, sa = float(np.cos(ang)), float(np.sin(ang))
+                    rx = rel0[0] * ca + rel0[2] * sa
+                    rz = -rel0[0] * sa + rel0[2] * ca
+                    self.plotter.camera.position = tuple((foc0 + np.array([rx, rel0[1], rz])).tolist())
+                    self.plotter.reset_camera_clipping_range()
+                    img = self.plotter.screenshot(return_img=True)
+                    writer.write(cv2.cvtColor(img[:, :, :3], cv2.COLOR_RGB2BGR))
+                    if k % 15 == 0:
+                        self.status_lbl.setText(f"Rendering turntable... ({k + 1}/{n_frames})")
+                        QApplication.processEvents()
+            finally:
+                self.plotter.camera.position = tuple(pos0.tolist())
+                self.plotter.camera.focal_point = tuple(foc0.tolist())
+                self.plotter.camera.up = tuple(up0.tolist())
+                self.plotter.reset_camera_clipping_range()
+                if self.isVisible():
+                    self.plotter.render()
+                writer.release()
+
+        self.status_lbl.setText(f"Saved turntable {out_path.name}")
+        self._log_milestone(f"Saved 360 turntable ({n_frames}f @ {fps}fps) -> {out_path}")
+        return out_path
 
     def closeEvent(self, event):
         self.elapsed_timer.stop()

@@ -31,7 +31,7 @@ def main():
         "--load-scene",
         type=str,
         default=None,
-        help="load a cached .npz 3D scene directly into the native 3D viewer",
+        help="load a cached .npz, 3DGS .ply, or .glb/.obj scene directly into the native 3D viewer",
     )
     parser.add_argument(
         "--demo",
@@ -162,11 +162,16 @@ def main():
     app = QApplication.instance() or QApplication(sys.argv)
 
     cached_res = None
+    load_scene_file = None
     if args.load_scene:
         cache_p = Path(args.load_scene)
         if cache_p.exists():
-            from src.pipeline import load_result_cache
-            cached_res = load_result_cache(cache_p)
+            if cache_p.suffix.lower() == ".npz":
+                from src.pipeline import load_result_cache
+
+                cached_res = load_result_cache(cache_p)
+            else:
+                load_scene_file = cache_p
         else:
             print(f"[WARNING] --load-scene file not found: {cache_p}")
 
@@ -177,6 +182,8 @@ def main():
         initial_start_sec=args.start_sec,
         initial_end_sec=args.end_sec,
     )
+    if load_scene_file is not None:
+        win.load_saved_scene_file(load_scene_file)
     win.show()
     win.raise_()
     win.activateWindow()
